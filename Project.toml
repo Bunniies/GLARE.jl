@@ -1,0 +1,4 @@
+name = "GLARE"
+uuid = "acb144d2-9be1-4446-b0fc-25c386baf338"
+authors = ["Alessandro Conigli <alessandroconigli@gmail.com>"]
+version = "0.1.0"
