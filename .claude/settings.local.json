@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(grep -n \"struct.*GaugeField\" /Users/alessandroconigli/.julia/packages/LatticeGPU/9VS4W/src/YM/*.jl)",
+      "Bash(grep -n \"Eoft_\\\\|clover\\\\|atanh\" /Users/alessandroconigli/.julia/packages/LatticeGPU/9VS4W/src/YM/*.jl)",
+      "Bash(wc -l /Users/alessandroconigli/.julia/packages/LatticeGPU/9VS4W/src/Groups/*.jl)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)"
+    ]
+  }
+}

@@ -2,3 +2,19 @@ name = "GLARE"
 uuid = "acb144d2-9be1-4446-b0fc-25c386baf338"
 authors = ["Alessandro Conigli <alessandroconigli@gmail.com>"]
 version = "0.1.0"
+
+[deps]
+BDIO = "375f315e-f2c4-11e9-2ef9-134f02f79e27"
+CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
+DelimitedFiles = "8bb1440f-4735-579b-a4ab-409b98df4dab"
+HDF5 = "f67ccb44-e63f-5c2f-98bd-6dc0ccc4ba2f"
+LatticeGPU = "958c3683-801a-4582-9cfa-2d6e2ae1763b"
+OrderedCollections = "bac558e1-5e72-5ebc-8fee-abe8a469f55d"
+PyPlot = "d330b81b-6aea-500a-939a-2ce795aea3ee"
+Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
+
+[extras]
+Test = "8dfed614-e22c-358a-3a63-7522a49b5df4"
+
+[targets]
+test = ["Test"]
