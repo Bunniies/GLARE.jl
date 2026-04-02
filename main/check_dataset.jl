@@ -1,10 +1,9 @@
 using GLARE
 using LatticeGPU
-using Test
 using HDF5
+
 # ---------------------------------------------------------------------------
 # Lattice parameters for CLS ensemble A654
-# VOL = (48, 24, 24, 24),  SVOL = (8, 4, 4, 4),  periodic BC
 # ---------------------------------------------------------------------------
 VOL   = (48, 24, 24, 24)
 SVOL  = (8, 4, 4, 4)
@@ -12,60 +11,59 @@ BC    = BC_PERIODIC
 TWIST = (0, 0, 0, 0, 0, 0)
 lp    = SpaceParm{4}(VOL, SVOL, BC, TWIST)
 
-path_to_cnfg = "/Users/alessandroconigli/Lattice/data/cls/"
-path_to_corr = "/Users/alessandroconigli/Lattice/data/HVP/LMA/A654_all_t_sources/dat"
-cnfgs = readdir(path_to_cnfg)
+ensemble_path = "/Users/alessandroconigli/Lattice/data/cls"
+lma_path      = "/Users/alessandroconigli/Lattice/data/HVP/LMA/A654_all_t_sources/dat"
+
+POLARIZATIONS = ["g1-g1", "g2-g2", "g3-g3"]
+EM            = "VV"
+
+outdir     = "/Users/alessandroconigli/Lattice/data/HVP/LMA/hdf5/A654_all_t_sources"
+scalar_h5  = joinpath(outdir, "A654_gauge_scalar.h5")
+matrix_h5  = joinpath(outdir, "A654_gauge_matrix.h5")
+corr_h5    = joinpath(outdir, "A654_corr.h5")
 
 # ---------------------------------------------------------------------------
-# Build a reader and load the configuration
+# Build scalar gauge database (all configs)
 # ---------------------------------------------------------------------------
-cnfg_reader = set_reader("cern", lp)
-U = cnfg_reader(joinpath(path_to_cnfg, cnfgs[1]))
-
-# ---------------------------------------------------------------------------
-# plaquette_scalar_field: shape
-# ---------------------------------------------------------------------------
-scalars = plaquette_scalar_field(U, lp)
+build_gauge_dataset(ensemble_path, lp, scalar_h5; verbose=true)
 
 # ---------------------------------------------------------------------------
-# plaquette_field: shape and element type
+# Build matrix gauge database (all configs)
+# Separate file — only needed for Phase 2 (L-CNN). Can be skipped for now.
 # ---------------------------------------------------------------------------
-plaq = plaquette_field(U, lp)
-
-# ---------------------------------------------------------------------------
-# read_contrib_all_sources: re contribution only
-# ---------------------------------------------------------------------------
-GAMMA_TEST = "g5-g5"
-EM         = "VV"
-fname_lma = readdir(path_to_corr)
-filter!(x->x!= "convert", fname_lma)
-
-p_re_cnfg1 = joinpath(path_to_corr, fname_lma[1])
-p_re_cnfg1_redat = filter(x->occursin("mseig$(EM)re", x), readdir(p_re_cnfg1,join=true))[1]
-
-re_dict = read_contrib_all_sources(p_re_cnfg1_redat, GAMMA_TEST)
+# build_gauge_matrix_dataset(ensemble_path, lp, matrix_h5; verbose=true)
 
 # ---------------------------------------------------------------------------
-# get_LMAConfig_all_sources: full LMA config
+# Build correlator database (all three vector polarizations)
 # ---------------------------------------------------------------------------
-cnfg = get_LMAConfig_all_sources(p_re_cnfg1, GAMMA_TEST; em=EM)
+build_corr_dataset(lma_path, corr_h5;
+                   em=EM, polarizations=POLARIZATIONS, verbose=true)
 
+# ---------------------------------------------------------------------------
+# Inspect the resulting files
+# ---------------------------------------------------------------------------
+println("\n--- Scalar gauge database ---")
+h5open(scalar_h5, "r") do fid
+    cfg_ids = sort(keys(fid["configs"]), by=x->parse(Int,x))
+    println("configs : $(length(cfg_ids))")
 
-# --------------------------------------------------
-# buil_dataset test
-# --------------------------------------------------
-output_path = tempname() * ".h5"
-
-output_path = "/Users/alessandroconigli/Lattice/data/HVP/LMA/hdf5/A654_all_t_sources/A654_test.hf"
-build_dataset(path_to_cnfg, path_to_corr, lp, output_path; gamma=GAMMA_TEST, em=EM, verbose=true)
-
-isfile(output_path)
-
-metadata = nothing
-configsdata = nothing
-h5open(output_path, "r") do fid
-    global metadata = read(fid["metadata"])
-    global configsdata = read(fid["configs"])
+    cid = first(cfg_ids)
+    ps  = read(fid["configs"][cid]["plaq_scalar"])
+    println("plaq_scalar shape : $(size(ps))  (iL×npls = $(lp.iL)×$(lp.npls))")
+    println("plaq_scalar range : [$(minimum(ps)), $(maximum(ps))]")
 end
 
+println("\n--- Correlator database ---")
+h5open(corr_h5, "r") do fid
+    cfg_ids = sort(keys(fid["configs"]), by=x->parse(Int,x))
+    println("configs        : $(length(cfg_ids))")
+    println("em             : $(read(fid["metadata"]["em"]))")
+    println("polarizations  : $(read(fid["metadata"]["polarizations"]))")
 
+    cid = first(cfg_ids)
+    for pol in POLARIZATIONS
+        co  = read(fid["configs"][cid][pol]["correlator"])
+        src = read(fid["configs"][cid][pol]["sources"])
+        println("  $(pol): correlator $(size(co)), $(length(src)) sources")
+    end
+end

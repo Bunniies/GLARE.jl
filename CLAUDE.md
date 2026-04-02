@@ -1,154 +1,107 @@
-# GLARE — Claude Code Context
+# GLARE — Project Overview
 
-## Project goal
+## Goal
 
-Build a gauge-equivariant neural network in Julia/Flux.jl that takes SU(3) gauge
-configurations as input and predicts the rest-eigen correlator C(t) per configuration,
-for variance reduction in lattice QCD ensembles.
+Gauge-equivariant neural network in Julia/Flux.jl: SU(3) gauge config → rest-eigen
+vector correlator C(t) per config, for **cost reduction** in lattice QCD ensembles.
 
-Blueprint: arXiv:2602.21617 (supervised regression framework) + arXiv:2304.10438 (L-CNN
-gauge-equivariant architecture). Full architecture plan is in PLAN.md.
+Blueprint: arXiv:2602.21617 (supervised regression) + arXiv:2003.06413 (L-CNN architecture).
+
+## Cost-reduction estimator (central scientific goal)
+
+**This is NOT variance reduction — it is cost reduction.** The estimator is:
+
+```
+C_corrected(t) = <C_approx_test(t)> + (<C_exact_bc(t)> - <C_approx_bc(t)>)
+```
+
+- `C_approx(t)` = NN prediction from gauge config (cheap, per-config)
+- `C_exact(t)`  = full LMA correlator (expensive, only for a subset)
+- `test` subset = all configs where only gauge field is available
+- `bc` subset   = small set with both gauge field AND exact LMA (bias correction)
+
+With optimal NN (MSE training), `Var(C_exact - C_approx) = (1 - r²)·Var(C_exact)`.
+At mid-t with scalar plaquette inputs r~0.1 → bias correction adds back ~99% variance.
+The equivariant L-CNN is required to push r high enough for the scheme to be viable.
+
+`train_ids` and `bc_ids` must never overlap (enforced by `split_configs`).
+
+## Three-database design
+
+| File | Content | Built by |
+|---|---|---|
+| `*_gauge_scalar.h5` | `plaq_scalar` Float64[iL[1],iL[2],iL[3],iL[4],npls] | `build_gauge_dataset` |
+| `*_gauge_matrix.h5` | `plaq_matrix` ComplexF64[6,iL[1],iL[2],iL[3],iL[4],npls] | `build_gauge_matrix_dataset` |
+| `*_corr.h5`         | LMA re correlators, all 3 polarizations | `build_corr_dataset` |
+
+- Scalar and matrix databases are separate files — matrix (~8× larger) only needed for Phase 2.
+- All three files share the same config id keys (trailing integer after `n` in gauge filenames).
+- **Three vector polarizations:** `"g1-g1"`, `"g2-g2"`, `"g3-g3"` — all used as training targets,
+  tripling the training signal. `"g5-g5"` (pseudoscalar) is NOT a target.
 
 ## Repository layout
 
 ```
 src/
-  GLARE.jl        — top-level module, includes and re-exports submodules
-  IO.jl           — module IO: gauge config readers (CERN, lex64, native, bsfqcd)
-  Plaquette.jl    — module Plaquette: per-site plaquette fields (untraced + scalar)
-  Correlator.jl   — module Correlator: LMA correlator reader (rest-eigen, ee, rr)
-test/
-  runtests.jl          — Pkg.test() entry point
-  test_reader.jl       — IO tests: shape, unitarity of loaded links
-  test_plaquette.jl    — Plaquette tests: shape, SU(3) closure, consistency, plane check
-  test_correlator.jl   — Correlator tests: LMAConfig shape, source consistency, flags
-PLAN.md           — full phased implementation plan
+  GLARE.jl          — top-level module
+  IO.jl             — gauge config readers (CERN format)
+  Plaquette.jl      — per-site plaquette fields (untraced + scalar)
+  Correlator.jl     — LMA correlator reader (rest-eigen only)
+  Dataset.jl        — build_gauge_dataset, build_gauge_matrix_dataset, build_corr_dataset
+  Preprocessing.jl  — split, normalization, data loading
+  Model.jl          — PeriodicConv4D, build_baseline_cnn, pearson_r
+test/               — see test/CLAUDE.md
+main/               — see main/CLAUDE.md
+PLAN.md             — full phased implementation plan
 ```
 
-## Key dependencies
+See `src/CLAUDE.md` for per-module API details.
 
-- **LatticeGPU** (`igit.ific.uv.es/alramos/latticegpu.jl`, Alberto Ramos group, IFIC Valencia)
-  — installed at `~/.julia/packages/LatticeGPU/9VS4W/`
-  — provides: `SU3{T}`, `SpaceParm`, `up`, `dw`, `point_index`, `point_coord`,
-    `tr`, `dev_one`, `BC_PERIODIC` etc.
-- **BDIO** — binary I/O
-- **CUDA** — GPU support (not yet used in GLARE code; configs read to CPU)
+## What's done / what's next
 
-## What is implemented
-
-### `src/IO.jl`
-- `import_cern64(fname, ibc, lp; log=true)` — reads OpenQCD/CERN double-precision
-  binary format. Returns `Array{SU3{Float64}, 3}` of shape `(bsz, ndim, rsz)` (CPU).
-  Direction convention in file: (t,x,y,z) → remapped to LatticeGPU order (x,y,z,t)
-  via `dtr = [4,1,2,3]`.
-- `set_reader(fmt, lp)` — factory returning the right reader closure for a given
-  format string (`"cern"`, `"lex64"`, `"native"`, `"bsfqcd"`) and `SpaceParm`.
-
-### `src/Plaquette.jl`
-- `plaquette_field(U, lp)` — returns `Array{SU3{T},3}` of shape `(bsz, npls, rsz)`,
-  containing the **untraced** Wilson plaquette `P_μν(x)` at every site and plane.
-  Formula: `U[b,id1,r] * U[bu1,id2,ru1] / (U[b,id2,r] * U[bu2,id1,ru2])`
-  where `/` = right-multiply by conjugate transpose (LatticeGPU convention).
-- `plaquette_scalar_field(U, lp)` — returns `Array{Float64,3}` of shape `(bsz, npls, rsz)`,
-  containing `Re(Tr P_μν(x))` at every site and plane — the 6-channel gauge-invariant
-  scalar input for the baseline CNN.
-
-Both functions currently dispatch only on `BC_PERIODIC`. Plane ordering: `(N,N-1), ..., (2,1)`
-matching `lp.plidx`.
-
-### `src/Correlator.jl`
-- `LMAConfig` — mutable struct: `ncnfg::Int64`, `gamma::String`, `eigmodes::Int64`,
-  `data::Dict{Any,Any}`. `data` has keys `"ee"`, `"re"`, `"rr"`, each an
-  `OrderedDict{String, Vector{Float64}}` keyed by source position string.
-- `read_contrib_all_sources(path, g)` — reads one `.dat` file (all sources in one file)
-  for a given gamma structure. Returns `OrderedDict{String, Vector{Float64}}`.
-  File format: `#tsrc=N` blocks, each containing `#<gamma>` sections with T rows of data.
-  tvals is detected dynamically (no hardcoded lattice size).
-- `get_LMAConfig_all_sources(path, g; em, bc, re_only)` — reads all three LMA contributions
-  from a config directory. File naming: `mseig{em}ee.dat`, `mseig{em}re.dat`, `mseig{em}rr.dat`.
-  `em="VV"` → 64 modes, `em="PA"` → 32 modes.
-- Test config path: `ENV["GLARE_TEST_CORR"]` → directory for one config with all three `.dat` files.
-
-## Known quirks
-
-### `Re(Tr P)` normalization
-`LatticeGPU.tr(::SU3)` returns the **full complex trace** `u11 + u22 + conj(u11*u22 - u12*u21)`.
-For identity: `tr = 3`. For typical CLS plaquettes, `Re(tr(P))` ≈ 0.5 (per site/plane average),
-which is ~1/3 of the value stored in the CERN file header (`avgpl ≈ 1.57`).
-The relationship `avg_plaq * 3 ≈ avgpl` has been empirically confirmed but the exact
-normalization difference between GLARE's computation and OpenQCD's header value is not yet
-fully understood. The values in `plaquette_scalar_field` are `Re(Tr P) ∈ [-3, 3]` not
-the normalized plaquette `Re(Tr P)/3`.
-
-### SU(3) closure test
-`dev_one(P)` measures distance from the **identity matrix**, NOT SU(3)-ness.
-To test unitarity: use `dev_one(P / P)` which gives `dev_one(P · P†)` → 0 for SU(3).
-
-### Config path
-Default test config: `/Users/alessandroconigli/Lattice/data/cls/A654r000n1`
-Override with `ENV["GLARE_TEST_CONF"]`. Tests skip gracefully if file is absent.
-Ensemble: CLS A654, `VOL=(48,24,24,24)`, `SVOL=(8,4,4,4)`, `BC_PERIODIC`, no twist.
-
-## What needs to be done next
+### Phase 0 — Data pipeline ✓
+- Gauge scalar + matrix HDF5 builders with `config_range` for parallel server jobs
+- Correlator HDF5 builder (3 polarizations)
+- 4-way interleaved split (train/val/test/bc), global z-score normalization
+- Diagnostic scripts: `check_dataset.jl`, `check_normalization.jl`
+- Pearson r analysis: scalar plaquette gives r~0.1 at mid-t → equivariant CNN required
 
 ### Phase 0 (remaining)
-- [x] **Step 0.2a: Correlator reader** — `src/Correlator.jl`
-  - `LMAConfig` struct, `read_contrib_all_sources`, `get_LMAConfig_all_sources`
-  - Ported from `LmaPredict.jl/DataReader_all_t_sources.jl`
-  - Test via `ENV["GLARE_TEST_CORR"]` pointing to a config dir with `mseig{em}ee/re/rr.dat`
-- [ ] **Step 0.2b: Build dataset pipeline**
-  - Loop over an ensemble of configs: load U, compute `plaquette_scalar_field` (baseline)
-    or `plaquette_field` (equivariant), load C(t) via `get_LMAConfig_all_sources`, store as
-    `(features, correlator)` pairs in HDF5 format.
-  - Add HDF5.jl to deps; write `src/Dataset.jl` with `build_dataset` function.
-- [ ] **Step 0.3: Data preprocessing**
-  - Normalize features (zero mean, unit variance per plane-channel).
-  - Normalize target C(t) (or use log-correlator).
-  - Train/val/test split (70/15/15) — never mix configurations across splits.
+- [x] `merge_dataset` — merge per-config HDF5 files (from server) into single training file
 
-### Phase 1 — Baseline CNN (gauge-invariant scalar inputs)
-- [ ] Implement `PeriodicConv4D` — 4D convolution with periodic (circular) padding.
-- [ ] Assemble baseline CNN: `PeriodicConv4D → relu → ... → spatial mean → MLP → C_pred(t)`.
-- [ ] Write training loop with Adam optimiser + MSE loss.
-- [ ] Evaluate: Pearson correlation r(t) and relative MSE per time slice.
+### Phase 1 — Baseline CNN ✓ (implemented, not yet trained)
+- [x] `PeriodicConv4D` — 4D conv with exact circular padding
+- [x] `build_baseline_cnn` — full chain: conv → spatial mean → MLP → `(Lt, npol, B)`
+- [x] `train_baseline.jl` — training loop, Adam, per-epoch val loss + Pearson r
+- [ ] Run training, evaluate r(t) on test set — sets performance floor for L-CNN
 
-### Phase 2 — Gauge-equivariant architecture (L-CNN)
-- [ ] `GaugeEquivConv` layer: parallel transport + trainable scalar channel weights.
-  Formula: `Σ_μ [w_μ U_μ(x) Φ(x+μ) U†_μ(x) + w_{-μ} U†_μ(x-μ) Φ(x-μ) U_μ(x-μ)]`
-- [ ] `ScalarGate` nonlinearity: `σ(Re(Tr Φ)) * Φ` — preserves gauge equivariance.
-- [ ] `BilinearLayer`: `Φ_out^a = Σ_{b,c} W_{abc} Φ^b · Φ^c`.
-- [ ] `TraceAndAggregate`: `Re(Tr Φ(x))` → spatial mean per time slice → `[Lt, channels]`.
-- [ ] Full model assembly + explicit gauge-equivariance unit test (transform U by random
-  Ω(x) ∈ SU(3), assert `model(U^Ω) ≈ model(U)`).
-- [ ] Add `ChainRulesCore.rrule` for SU3 matrix ops if Zygote AD fails.
+### Phase 2 — Gauge-equivariant L-CNN
+- [ ] `GaugeEquivConv`: parallel transport + scalar channel weights (arXiv:2003.06413)
+- [ ] `ScalarGate`: `σ(Re(Tr Φ)) * Φ` nonlinearity
+- [ ] `BilinearLayer`: `Φ_out^a = Σ_{b,c} W_{abc} Φ^b · Φ^c`
+- [ ] `TraceAndAggregate`: Re(Tr Φ) → spatial mean → `[Lt, channels]`
+- [ ] Gauge-equivariance unit test
+- [ ] Build `*_gauge_matrix.h5` for Phase 2 inputs
+- [ ] Smeared input copies (Stout, ρ=0.1) as additional channels (arXiv:2304.10438 §V)
 
 ### Phase 3 — Training and evaluation
-- [ ] Weighted MSE loss (weight by `1/var(C(t))` across configs to handle late-time noise).
-- [ ] Learning rate schedule (cosine annealing or ReduceLROnPlateau).
-- [ ] Variance reduction factor: key metric from arXiv:2602.21617.
-- [ ] Bias correction (control-variate estimator):
-  `C_corrected(t) = C_pred(t) + mean_{labeled}(C_true - C_pred)(t)`
+- [ ] Weighted MSE loss (`1/var(C(t))`)
+- [ ] LR schedule (cosine annealing or ReduceLROnPlateau)
+- [ ] Variance reduction factor r²(t) as primary metric
+- [ ] Bias correction: `C_corrected(t) = C_pred(t) + mean_bc(C_true - C_pred)(t)`
 
 ### Phase 4 — Extensions
-- [ ] Larger Wilson loops (1×2 rectangles) as additional input channels.
-- [ ] GPU support for `plaquette_field` / `plaquette_scalar_field` (CUDA kernels or
-  CuArray-compatible broadcast).
-- [ ] Gauge-equivariant pooling / multiscale U-Net hierarchy.
-- [ ] Generalisation across β and L.
+- [ ] Larger Wilson loops (1×2 rectangles) as additional input channels
+- [ ] GPU support (CuArray-compatible kernels)
+- [ ] Gauge-equivariant pooling / multiscale U-Net
+- [ ] Generalisation across β and L
 
-## LatticeGPU reference
+## Key paper references
 
-Key types and functions used from LatticeGPU:
-| Symbol | File | Purpose |
-|---|---|---|
-| `SU3{T}` | `Groups/SU3Types.jl` | SU(3) group element (stores first 2 rows) |
-| `M3x3{T}` | `Groups/SU3Types.jl` | Full 3×3 complex matrix |
-| `SpaceParm{N,M,B,D}` | `Space/Space.jl` | Lattice geometry + block decomposition |
-| `up(p, id, lp)` | `Space/Space.jl` | Forward neighbour index |
-| `dw(p, id, lp)` | `Space/Space.jl` | Backward neighbour index |
-| `point_index(pt, lp)` | `Space/Space.jl` | CartesianIndex → (b,r) |
-| `point_coord(p, lp)` | `Space/Space.jl` | (b,r) → CartesianIndex |
-| `tr(::SU3)` | `Groups/GroupSU3.jl` | Complex trace: u11+u22+conj(u11*u22-u12*u21) |
-| `dev_one(::SU3)` | `Groups/GroupSU3.jl` | Distance from identity (NOT SU3-ness) |
-| `tensor_field(T, lp)` | `Fields/Fields.jl` | CuArray of shape (bsz, npls, rsz) |
-| `BC_PERIODIC` etc. | `Space/Space.jl` | Boundary condition constants |
+| arXiv | Role |
+|---|---|
+| 2602.21617 | Application blueprint: config-by-config regression + bias correction |
+| 2003.06413 | Foundational L-CNN: parallel transport conv, scalar gate, trace layer |
+| 2304.10438 | Gauge-equivariant pooling + smeared inputs as multi-scale features |
+| 2602.23840 | Novel gauge-equivariant architecture (Pfahler et al. 2026) |
+| 2501.16955 | Gauge-covariant Transformer — future extension |

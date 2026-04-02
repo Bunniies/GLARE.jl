@@ -4,7 +4,7 @@ using HDF5
 using Statistics
 
 export split_configs, NormStats, compute_normalization, save_normalization,
-       load_normalization, load_config, load_split
+       load_normalization, load_gauge, load_corr, load_config, load_split
 
 # ---------------------------------------------------------------------------
 # Train / val / test / bias_correction split
@@ -25,9 +25,10 @@ assigned to whichever split is currently furthest below its target fraction.
 This spreads each split uniformly throughout the chain rather than in
 contiguous blocks, minimising autocorrelations within every split.
 
-The `bias_corr` split contains configurations for which both the gauge field
-and the expensive observable are available; they are used to apply an unbiased
-correction to the NN prediction at inference time.
+The `bias_corr` split contains configurations used to apply an unbiased
+correction to the NN prediction at inference time. It must never overlap
+with `train_ids`. Pass either the gauge or the correlator HDF5 path —
+both share the same `configs/<id>` key structure.
 
 Returns four `Vector{String}` of config id keys in MC order.
 """
@@ -78,24 +79,35 @@ struct NormStats
 end
 
 """
-    compute_normalization(h5path, train_ids) -> NormStats
+    compute_normalization(gauge_h5, corr_h5, train_ids;
+                          polarizations = ["g1-g1", "g2-g2", "g3-g3"]) -> NormStats
 
 Compute per-plane feature statistics and per-time-slice correlator statistics
-from the training split only. All sources are included when computing
-correlator statistics.
+from the training split only. Feature stats come from `plaq_scalar` in
+`gauge_h5`; correlator stats are pooled across all `polarizations` in `corr_h5`.
 
 Feature stats: mean and std of `plaq_scalar[b, ipl, r]` across all sites
 (b, r) and all training configs, separately for each plane `ipl`.
 
-Correlator stats: mean and std of `correlator[t, src]` across all sources
-and all training configs, separately for each time slice `t`.
-"""
-function compute_normalization(h5path::String, train_ids::Vector{String})
-    isempty(train_ids) && error("train_ids is empty")
+Correlator stats: mean and std of `correlator[t, src]` across all sources,
+all training configs, and all polarizations, separately for each time slice `t`.
+Pooling across polarizations keeps the scales comparable for all targets.
 
-    npls, T = h5open(h5path, "r") do fid
-        grp = fid["configs"][train_ids[1]]
-        size(read(grp["plaq_scalar"]), 2), size(read(grp["correlator"]), 1)
+**Never uses val/test/bc data.**
+"""
+function compute_normalization(gauge_h5::String, corr_h5::String,
+                                train_ids::Vector{String};
+                                polarizations::Vector{String} = ["g1-g1", "g2-g2", "g3-g3"])
+
+    isempty(train_ids)    && error("train_ids is empty")
+    isempty(polarizations) && error("polarizations must be non-empty")
+
+    npls = h5open(gauge_h5, "r") do fid
+        size(read(fid["configs"][train_ids[1]]["plaq_scalar"]), 5)  # last dim of (L1,L2,L3,L4,npls)
+    end
+
+    T = h5open(corr_h5, "r") do fid
+        size(read(fid["configs"][train_ids[1]][polarizations[1]]["correlator"]), 1)
     end
 
     feat_sum  = zeros(Float64, npls)
@@ -106,25 +118,29 @@ function compute_normalization(h5path::String, train_ids::Vector{String})
     corr_sum2 = zeros(Float64, T)
     corr_n    = 0
 
-    h5open(h5path, "r") do fid
+    h5open(gauge_h5, "r") do gfid
         for cid in train_ids
-            grp = fid["configs"][cid]
-
-            ps = read(grp["plaq_scalar"])   # Float64[bsz, npls, rsz]
+            ps = read(gfid["configs"][cid]["plaq_scalar"])
             for ipl in 1:npls
-                vals = @view ps[:, ipl, :]
+                vals = @view ps[:, :, :, :, ipl]
                 feat_sum[ipl]  += sum(vals)
                 feat_sum2[ipl] += sum(vals .^ 2)
                 feat_n[ipl]    += length(vals)
             end
+        end
+    end
 
-            co = read(grp["correlator"])    # Float64[T, nsrcs]
-            for t in 1:T
-                vals = @view co[t, :]
-                corr_sum[t]  += sum(vals)
-                corr_sum2[t] += sum(vals .^ 2)
+    h5open(corr_h5, "r") do cfid
+        for cid in train_ids
+            for pol in polarizations
+                co = read(cfid["configs"][cid][pol]["correlator"])
+                for t in 1:T
+                    vals = @view co[t, :]
+                    corr_sum[t]  += sum(vals)
+                    corr_sum2[t] += sum(vals .^ 2)
+                end
+                corr_n += size(co, 2)   # nsrcs per (config, polarization)
             end
-            corr_n += size(co, 2)
         end
     end
 
@@ -132,9 +148,8 @@ function compute_normalization(h5path::String, train_ids::Vector{String})
     feat_var  = feat_sum2 ./ feat_n .- feat_mean .^ 2
     feat_std  = sqrt.(max.(feat_var, 0.0))
 
-    n_corr    = corr_n * length(train_ids)
-    corr_mean = corr_sum  ./ n_corr
-    corr_var  = corr_sum2 ./ n_corr .- corr_mean .^ 2
+    corr_mean = corr_sum  ./ corr_n
+    corr_var  = corr_sum2 ./ corr_n .- corr_mean .^ 2
     corr_std  = sqrt.(max.(corr_var, 0.0))
 
     feat_std[feat_std .< 1e-12] .= 1.0
@@ -147,7 +162,7 @@ end
     save_normalization(h5path, stats::NormStats)
 
 Write normalization statistics into the `normalization/` group of an existing
-HDF5 dataset file. Overwrites if the group already exists.
+HDF5 file. Overwrites if the group already exists.
 """
 function save_normalization(h5path::String, stats::NormStats)
     h5open(h5path, "r+") do fid
@@ -181,74 +196,103 @@ end
 # ---------------------------------------------------------------------------
 
 """
-    load_config(h5path, cid; stats=nothing, field=:scalar)
-        -> (features, correlator)
+    load_gauge(gauge_h5, cid; stats=nothing, field=:scalar) -> features
 
-Load a single configuration from the HDF5 dataset.
+Load plaquette features for one configuration from a gauge database.
 
-- `features`   : `Float64[bsz, npls, rsz]` (scalar) or `ComplexF64[6, bsz, npls, rsz]` (matrix)
-- `correlator` : `Float64[T, nsrcs]`
+- `field = :scalar` → `Float64[iL[1], iL[2], iL[3], iL[4], npls]`
+  Pass the path to the scalar gauge database (`gauge_scalar_db.h5`).
+- `field = :matrix` → `ComplexF64[6, iL[1], iL[2], iL[3], iL[4], npls]`
+  Pass the path to the matrix gauge database (`gauge_matrix_db.h5`).
 
-If `stats::NormStats` is provided, features and correlator are z-score normalized:
-    `(x - mean) / std`
-per plane for features and per time slice for the correlator.
-Normalization is not applied to `plaq_matrix` (complex SU3 matrices).
-
-The `field` keyword selects which plaquette representation to return:
-- `:scalar`  — `plaq_scalar` (for baseline CNN)
-- `:matrix`  — `plaq_matrix` (for equivariant L-CNN)
-- `:both`    — returns a `NamedTuple (scalar=..., matrix=...)`
+If `stats::NormStats` is provided, `plaq_scalar` is z-score normalized per
+plane. `plaq_matrix` is never normalized (complex SU3 matrices).
 """
-function load_config(h5path::String, cid::String;
-                     stats::Union{NormStats, Nothing} = nothing,
-                     field::Symbol = :scalar)
+function load_gauge(gauge_h5::String, cid::String;
+                    stats::Union{NormStats, Nothing} = nothing,
+                    field::Symbol = :scalar)
 
-    field in (:scalar, :matrix, :both) ||
-        error("field must be :scalar, :matrix, or :both")
+    field in (:scalar, :matrix) ||
+        error("field must be :scalar or :matrix")
 
-    features, correlator = h5open(h5path, "r") do fid
+    features = h5open(gauge_h5, "r") do fid
         haskey(fid["configs"], cid) ||
-            error("Config \"$(cid)\" not found in $(h5path)")
+            error("Config \"$(cid)\" not found in $(gauge_h5)")
         grp = fid["configs"][cid]
-        if field in (:matrix, :both) && !haskey(grp, "plaq_matrix")
-            error("plaq_matrix not found in config \"$(cid)\". " *
-                  "Rebuild the dataset with save_matrix=true.")
-        end
-        feat = if field == :scalar
-            read(grp["plaq_scalar"])
-        elseif field == :matrix
-            read(grp["plaq_matrix"])
-        else
-            (scalar = read(grp["plaq_scalar"]),
-             matrix = read(grp["plaq_matrix"]))
-        end
-        feat, read(grp["correlator"])
+        key = field == :scalar ? "plaq_scalar" : "plaq_matrix"
+        haskey(grp, key) ||
+            error("\"$(key)\" not found for config \"$(cid)\" in $(gauge_h5). " *
+                  "Make sure you are passing the correct database file.")
+        read(grp[key])
     end
 
-    stats === nothing && return features, correlator
+    stats === nothing && return features
+    return _normalize_features(features, stats, field)
+end
 
-    features   = _normalize_features(features, stats, field)
-    correlator = _normalize_correlator(correlator, stats)
+"""
+    load_corr(corr_h5, cid; stats=nothing, polarization="g1-g1") -> correlator
+
+Load the correlator `Float64[T, nsrcs]` for one configuration and one
+polarization from the correlator database. Applies z-score normalization
+per time slice if `stats::NormStats` is provided.
+"""
+function load_corr(corr_h5::String, cid::String;
+                   stats::Union{NormStats, Nothing} = nothing,
+                   polarization::String = "g1-g1")
+
+    correlator = h5open(corr_h5, "r") do fid
+        haskey(fid["configs"], cid) ||
+            error("Config \"$(cid)\" not found in $(corr_h5)")
+        grp = fid["configs"][cid]
+        haskey(grp, polarization) ||
+            error("Polarization \"$(polarization)\" not found for config \"$(cid)\". " *
+                  "Rebuild with the desired polarizations.")
+        read(grp[polarization]["correlator"])
+    end
+
+    stats === nothing && return correlator
+    return _normalize_correlator(correlator, stats)
+end
+
+"""
+    load_config(gauge_h5, corr_h5, cid;
+                stats=nothing, field=:scalar, polarization="g1-g1")
+        -> (features, correlator)
+
+Load features and correlator for one configuration from the two-database
+design. Combines `load_gauge` and `load_corr`. Pass the appropriate gauge
+database path for the chosen `field` (`:scalar` or `:matrix`).
+"""
+function load_config(gauge_h5::String, corr_h5::String, cid::String;
+                     stats::Union{NormStats, Nothing} = nothing,
+                     field::Symbol = :scalar,
+                     polarization::String = "g1-g1")
+
+    features   = load_gauge(gauge_h5, cid; stats=stats, field=field)
+    correlator = load_corr(corr_h5, cid; stats=stats, polarization=polarization)
     return features, correlator
 end
 
 """
-    load_split(h5path, ids; stats=nothing, field=:scalar)
+    load_split(gauge_h5, corr_h5, ids;
+               stats=nothing, field=:scalar, polarization="g1-g1")
         -> (features_list, correlator_list)
 
-Load all configurations in `ids` from the HDF5 dataset, in the order given.
+Load all configurations in `ids` from the two-database design, in MC order.
 Returns two `Vector`s. If `stats` is provided, data is normalized.
 """
-function load_split(h5path::String, ids::Vector{String};
+function load_split(gauge_h5::String, corr_h5::String, ids::Vector{String};
                     stats::Union{NormStats, Nothing} = nothing,
-                    field::Symbol = :scalar)
+                    field::Symbol = :scalar,
+                    polarization::String = "g1-g1")
 
     features_list   = Vector{Any}(undef, length(ids))
     correlator_list = Vector{Matrix{Float64}}(undef, length(ids))
     for (i, cid) in enumerate(ids)
-        features_list[i], correlator_list[i] = load_config(h5path, cid;
-                                                            stats=stats,
-                                                            field=field)
+        features_list[i], correlator_list[i] =
+            load_config(gauge_h5, corr_h5, cid;
+                        stats=stats, field=field, polarization=polarization)
     end
     return features_list, correlator_list
 end
@@ -270,13 +314,13 @@ throughout the sequence (maximally separated) without any shuffling.
 function _interleaved_assign(N::Int, fracs::Vector{Float64})
     nsplits = length(fracs)
     labels  = Vector{Int}(undef, N)
-    acc     = zeros(Float64, nsplits)   # accumulated deficit per split
+    acc     = zeros(Float64, nsplits)
 
     for i in 1:N
-        acc .+= fracs                   # each split "earns" its fraction
-        j = argmax(acc)                 # most underserved split
+        acc .+= fracs
+        j = argmax(acc)
         labels[i] = j
-        acc[j] -= 1.0                   # "spend" one assignment
+        acc[j] -= 1.0
     end
 
     return labels
@@ -284,17 +328,15 @@ end
 
 function _normalize_features(features, stats::NormStats, field::Symbol)
     if field == :scalar
+        # features shape: (iL[1], iL[2], iL[3], iL[4], npls)
         out = similar(features)
-        for ipl in axes(features, 2)
-            out[:, ipl, :] = (features[:, ipl, :] .- stats.feat_mean[ipl]) ./
-                              stats.feat_std[ipl]
+        for ipl in axes(features, 5)
+            out[:, :, :, :, ipl] = (features[:, :, :, :, ipl] .- stats.feat_mean[ipl]) ./
+                                    stats.feat_std[ipl]
         end
         return out
-    elseif field == :matrix
-        return features   # complex matrices: not normalized via scalar stats
-    else  # :both
-        return (scalar = _normalize_features(features.scalar, stats, :scalar),
-                matrix = features.matrix)
+    else  # :matrix — complex SU3 entries, no normalization
+        return features
     end
 end
 
