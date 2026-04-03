@@ -1,0 +1,48 @@
+name: Documentation
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - '*'
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ startsWith(github.ref, 'refs/pull/') }}
+
+jobs:
+  docs:
+    name: Build and deploy docs
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      statuses: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: '1'
+
+      - uses: julia-actions/cache@v2
+
+      # Instantiate the main project first so that unregistered git deps
+      # (BDIO, LatticeGPU from igit.ific.uv.es) are downloaded into the depot.
+      # NOTE: if igit.ific.uv.es is not reachable from GitHub Actions runners,
+      # this step will fail. In that case, use local deployment (see README).
+      - name: Instantiate main project
+        run: julia --project=. -e 'using Pkg; Pkg.instantiate()'
+
+      # Instantiate the docs project (only Documenter).
+      # make.jl loads GLARE by pushing the parent dir onto LOAD_PATH so it
+      # reuses the already-resolved deps from the main project's depot.
+      - name: Instantiate docs project
+        run: julia --project=docs -e 'using Pkg; Pkg.instantiate()'
+
+      - name: Build and deploy
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DOCUMENTER_KEY: ${{ secrets.DOCUMENTER_KEY }}
+        run: julia docs/make.jl

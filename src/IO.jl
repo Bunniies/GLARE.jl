@@ -1,6 +1,6 @@
 module IO
 
-using CUDA, LatticeGPU
+using LatticeGPU
 
 export import_cern64, set_reader
 

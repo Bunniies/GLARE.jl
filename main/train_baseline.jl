@@ -8,11 +8,11 @@ using Random
 # ---------------------------------------------------------------------------
 # Configuration — edit these paths and hyperparameters
 # ---------------------------------------------------------------------------
+ENV["GLARE_TEST_GAUGE_H5"] = "/Users/alessandroconigli/Lattice/data/HVP/LMA/hdf5/A654_all_t_sources/A654_gauge_scalar_1_170.h5"
+ENV["GLARE_TEST_CORR_H5"]  = "/Users/alessandroconigli/Lattice/data/HVP/LMA/hdf5/A654_all_t_sources/A654_corr.h5"
 
-gauge_h5 = get(ENV, "GLARE_TEST_GAUGE_H5",
-               "/Users/alessandroconigli/Lattice/data/HVP/LMA/hdf5/A654_all_t_sources/A654_gauge_scalar.h5")
-corr_h5  = get(ENV, "GLARE_TEST_CORR_H5",
-               "/Users/alessandroconigli/Lattice/data/HVP/LMA/hdf5/A654_all_t_sources/A654_corr.h5")
+gauge_h5 = get(ENV, "GLARE_TEST_GAUGE_H5", "")
+corr_h5  = get(ENV, "GLARE_TEST_CORR_H5", "")
 
 isfile(gauge_h5) || error("Gauge HDF5 not found: $gauge_h5")
 isfile(corr_h5)  || error("Correlator HDF5 not found: $corr_h5")
@@ -50,6 +50,7 @@ println("Computing normalization statistics from train set...")
 stats = compute_normalization(gauge_h5, corr_h5, train_ids;
                               polarizations=POLARIZATIONS)
 
+##
 # ---------------------------------------------------------------------------
 # Data loading helpers
 # ---------------------------------------------------------------------------
