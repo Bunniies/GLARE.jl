@@ -86,15 +86,24 @@ the config-to-config fluctuations that are the regression signal.
 
 ## Model.jl
 
+### Phase 1 — Baseline CNN
+
 - `PeriodicConv4D(ch_in => ch_out, kernel; activation)` — 4D conv with exact circular padding.
   Wraps `Flux.Conv` with `pad=0`; pads input with `mod1` indexing before each forward pass.
-  Input/output shape: `(d1, d2, d3, d4, C, B)`.
+  Input/output shape: `(Lt, Ls, Ls, Ls, C, B)`.
 - `build_baseline_cnn(; Lt, npls, npol, channels, mlp_hidden)` → `Flux.Chain`
   Architecture: `PeriodicConv4D → relu → ... → spatial mean over dims(2,3,4) → MLP`
   Input: `(Lt, Ls, Ls, Ls, npls, B)`. Output: `(Lt, npol, B)`.
   Default: `channels=[16,16]`, `mlp_hidden=128`.
 - `pearson_r(y_pred, y_true)` → `Vector{Float64}` length Lt
   Pearson r per time slice, pooled across all polarizations.
+
+### Phase 2 — L-CNN
+
+- `su3_reconstruct(x)` — recover full 3×3 SU(3) matrices from first-two-row storage.
+  Input: `(6, rest...)` with entries `[u11,u12,u13,u21,u22,u23]` (layout from `build_gauge_matrix_dataset`).
+  Output: `(3, 3, rest...)` — row index first, column second.
+  Third row via `u3 = conj(u1 × u2)`. AD-safe (uses only `cat`/`reshape`).
 
 ## Known quirks
 

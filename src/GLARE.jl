@@ -19,7 +19,8 @@ export build_gauge_dataset, build_gauge_matrix_dataset, build_corr_dataset, merg
 include("Preprocessing.jl")
 using .Preprocessing
 export split_configs, NormStats, compute_normalization, save_normalization,
-       load_normalization, load_gauge, load_corr, load_config, load_split
+       load_normalization, load_gauge, load_corr, load_config, load_split,
+       PreloadedDataset, preload_dataset
 
 include("Model.jl")
 using .Model

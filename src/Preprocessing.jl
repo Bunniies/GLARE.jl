@@ -4,7 +4,8 @@ using HDF5
 using Statistics
 
 export split_configs, NormStats, compute_normalization, save_normalization,
-       load_normalization, load_gauge, load_corr, load_config, load_split
+       load_normalization, load_gauge, load_corr, load_config, load_split,
+       PreloadedDataset, preload_dataset
 
 # ---------------------------------------------------------------------------
 # Train / val / test / bias_correction split
@@ -89,9 +90,10 @@ from the training split only. Feature stats come from `plaq_scalar` in
 Feature stats: mean and std of `plaq_scalar[b, ipl, r]` across all sites
 (b, r) and all training configs, separately for each plane `ipl`.
 
-Correlator stats: mean and std of `correlator[t, src]` across all sources,
-all training configs, and all polarizations, separately for each time slice `t`.
-Pooling across polarizations keeps the scales comparable for all targets.
+Correlator stats: mean and std of the **source-averaged** correlator `C̄(t)`
+across all training configs and all polarizations, separately for each time
+slice `t`. Stats are computed on source-averaged data to match the training
+target, so that the normalized targets have unit variance.
 
 **Never uses val/test/bc data.**
 """
@@ -133,13 +135,13 @@ function compute_normalization(gauge_h5::String, corr_h5::String,
     h5open(corr_h5, "r") do cfid
         for cid in train_ids
             for pol in polarizations
-                co = read(cfid["configs"][cid][pol]["correlator"])
+                co   = read(cfid["configs"][cid][pol]["correlator"])
+                cbar = vec(mean(co, dims=2))   # source-averaged: Float64[T]
                 for t in 1:T
-                    vals = @view co[t, :]
-                    corr_sum[t]  += sum(vals)
-                    corr_sum2[t] += sum(vals .^ 2)
+                    corr_sum[t]  += cbar[t]
+                    corr_sum2[t] += cbar[t]^2
                 end
-                corr_n += size(co, 2)   # nsrcs per (config, polarization)
+                corr_n += 1   # one source-averaged sample per (config, polarization)
             end
         end
     end
@@ -295,6 +297,81 @@ function load_split(gauge_h5::String, corr_h5::String, ids::Vector{String};
                         stats=stats, field=field, polarization=polarization)
     end
     return features_list, correlator_list
+end
+
+# ---------------------------------------------------------------------------
+# In-memory dataset preloading
+# ---------------------------------------------------------------------------
+
+"""
+    PreloadedDataset
+
+In-memory cache mapping config id → `(feat, corr2d)` where:
+- `feat`   : `Float32[iL1, iL2, iL3, iL4, npls]` — normalised `plaq_scalar`
+- `corr2d` : `Float32[Lt, npol]` — source-averaged, normalised correlator
+              for all requested polarizations (column order = `polarizations` arg)
+
+Build with `preload_dataset`. Pass to the `load_batch(ids, cache)` overload
+in training scripts to avoid per-batch HDF5 reads.
+"""
+struct PreloadedDataset
+    data :: Dict{String, Tuple{Array{Float32, 5}, Matrix{Float32}}}
+end
+
+Base.length(d::PreloadedDataset)                = length(d.data)
+Base.getindex(d::PreloadedDataset, cid::String) = d.data[cid]
+Base.keys(d::PreloadedDataset)                  = keys(d.data)
+
+"""
+    preload_dataset(gauge_h5, corr_h5, ids, stats;
+                    polarizations = ["g1-g1","g2-g2","g3-g3"]) -> PreloadedDataset
+
+Load and normalise all configs in `ids` into RAM as `Float32` arrays, opening
+each HDF5 file only once. Intended for the gauge scalar database; matrix
+features are not supported here (too large to preload routinely).
+
+Memory estimate per config on A654 (48×24³×6 Float32): ≈ 24 MB.
+For 680 configs: ≈ 16 GB. Use Float32 storage in `build_gauge_dataset` to
+keep this within a typical 32–64 GB RAM budget.
+"""
+function preload_dataset(gauge_h5::String, corr_h5::String, ids::Vector{String},
+                         stats::NormStats;
+                         polarizations::Vector{String} = ["g1-g1", "g2-g2", "g3-g3"])
+    isempty(ids) && return PreloadedDataset(
+        Dict{String, Tuple{Array{Float32,5}, Matrix{Float32}}}())
+
+    npol = length(polarizations)
+    T    = h5open(corr_h5, "r") do fid
+        size(read(fid["configs"][ids[1]][polarizations[1]]["correlator"]), 1)
+    end
+
+    data = Dict{String, Tuple{Array{Float32, 5}, Matrix{Float32}}}()
+    sizehint!(data, length(ids))
+
+    h5open(gauge_h5, "r") do gfid
+        h5open(corr_h5, "r") do cfid
+            for cid in ids
+                # normalised features
+                raw  = read(gfid["configs"][cid]["plaq_scalar"])
+                feat = Float32.(_normalize_features(raw, stats, :scalar))
+
+                # source-averaged, normalised correlator
+                corr2d = Matrix{Float32}(undef, T, npol)
+                for (ipol, pol) in enumerate(polarizations)
+                    co   = read(cfid["configs"][cid][pol]["correlator"])
+                    cbar = vec(mean(co, dims=2))
+                    for t in 1:T
+                        corr2d[t, ipol] = Float32(
+                            (cbar[t] - stats.corr_mean[t]) / stats.corr_std[t])
+                    end
+                end
+
+                data[cid] = (feat, corr2d)
+            end
+        end
+    end
+
+    return PreloadedDataset(data)
 end
 
 # ---------------------------------------------------------------------------

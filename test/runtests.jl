@@ -8,4 +8,5 @@ using GLARE
     include("test_correlator.jl")
     include("test_dataset.jl")
     include("test_preprocessing.jl")
+    include("test_model.jl")
 end
