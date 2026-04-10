@@ -7,6 +7,12 @@ using Random
 using PyPlot
 
 # ---------------------------------------------------------------------------
+# Device selection — GPU if available, CPU otherwise.
+# Requires CUDA.jl (or Metal.jl on Apple Silicon) to be installed separately.
+# ---------------------------------------------------------------------------
+const device = Flux.gpu_device()
+
+# ---------------------------------------------------------------------------
 # Configuration — edit these paths and hyperparameters
 # ---------------------------------------------------------------------------
 ENV["GLARE_TEST_GAUGE_H5"] = "/Users/alessandroconigli/Lattice/data/HVP/LMA/hdf5/A654_all_t_sources/A654_gauge_scalar_1_680.h5"
@@ -25,9 +31,9 @@ mkpath(LOG_DIR)
 
 # Lattice dimensions — read from HDF5 metadata to stay in sync with the database
 Lt, Ls, npls = HDF5.h5open(gauge_h5, "r") do fid
-    vol  = read(fid["metadata"]["vol"])   # Int64[4]
+    vol  = read(fid["metadata"]["vol"])   # Int64[4]: lp.iL = (Lx, Ly, Lz, Lt) — t at index 4
     ps   = read(fid["configs"][first(keys(fid["configs"]))]["plaq_scalar"])
-    vol[1], vol[2], size(ps, 5)
+    vol[4], vol[1], size(ps, 5)           # Lt = vol[4], Ls = vol[1]
 end
 
 npol = 3
@@ -125,13 +131,16 @@ model = build_baseline_cnn(;
     npls       = npls,
     npol       = npol,
     channels   = CHANNELS,
-    mlp_hidden = MLP_HIDDEN)
+    mlp_hidden = MLP_HIDDEN) |> device
 
+# opt_state must be set up AFTER the model is on the target device.
 opt_state = Flux.setup(Adam(LR), model)
 
 # --- Gradient sanity check ---
 let
     _feats, _corrs = get_batch(train_ids[1:2], train_cache)
+    _feats = _feats |> device
+    _corrs = _corrs |> device
     _, _grads = Flux.withgradient(model) do m
         mean((m(_feats) .- _corrs).^2)
     end
@@ -158,7 +167,8 @@ end
 
 # Does the batched loss correlate with r? Quick sanity check:
 _feats_big, _corrs_big = get_batch(train_ids[1:32], train_cache)
-@printf("32-sample batch loss: %.5f\n", batch_loss(model, _feats_big, _corrs_big))
+@printf("32-sample batch loss: %.5f\n",
+        batch_loss(model, _feats_big |> device, _corrs_big |> device))
 
 # ---------------------------------------------------------------------------
 # Evaluation helper
@@ -171,16 +181,17 @@ function evaluate(model, ids, cache=nothing; batch_size=BATCH_SIZE)
     all_true   = Array{Float32}(undef, Lt, npol, 0)
 
     for start in 1:batch_size:length(ids)
-        batch_ids = ids[start:min(start + batch_size - 1, end)]
+        batch_ids    = ids[start:min(start + batch_size - 1, end)]
         feats, corrs = get_batch(batch_ids, cache)
-        pred = model(feats)
-        total_loss += mse_loss(pred, corrs)
-        n_batches  += 1
-        all_pred = cat(all_pred, pred;  dims=3)
-        all_true = cat(all_true, corrs; dims=3)
+        pred         = model(feats |> device)
+        pred_cpu     = Flux.cpu(pred)
+        total_loss  += Float64(mse_loss(pred_cpu, corrs))
+        n_batches   += 1
+        all_pred = cat(all_pred, pred_cpu; dims=3)
+        all_true = cat(all_true, corrs;    dims=3)
     end
 
-    r_per_t = pearson_r(Array{Float32}(all_pred), Array{Float32}(all_true))
+    r_per_t = pearson_r(all_pred, all_true)
     return total_loss / n_batches, r_per_t, all_pred, all_true
 end
 
@@ -206,15 +217,17 @@ for epoch in 1:EPOCHS
     n_batches  = 0
 
     for start in 1:BATCH_SIZE:length(train_ids)
-        batch_ids = train_ids[perm[start:min(start + BATCH_SIZE - 1, end)]]
+        batch_ids    = train_ids[perm[start:min(start + BATCH_SIZE - 1, end)]]
         feats, corrs = get_batch(batch_ids, train_cache)
+        feats        = feats  |> device
+        corrs        = corrs  |> device
 
         loss_val, grads = Flux.withgradient(model) do m
             batch_loss(m, feats, corrs)
         end
 
         Flux.update!(opt_state, model, grads[1])
-        epoch_loss += loss_val
+        epoch_loss += Float64(loss_val)
         n_batches  += 1
     end
 

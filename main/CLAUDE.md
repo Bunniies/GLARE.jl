@@ -4,9 +4,10 @@
 
 | Script | Purpose |
 |---|---|
-| `check_dataset.jl` | Build gauge scalar + correlator HDF5, inspect structure |
-| `check_normalization.jl` | Normalization checks + Pearson r plots (PyPlot) |
-| `train_baseline.jl` | Phase 1 baseline CNN training loop |
+| `baseline_training/check_dataset.jl` | Build gauge scalar + correlator HDF5, inspect structure |
+| `baseline_training/check_normalization.jl` | Normalization checks + Pearson r plots (PyPlot) |
+| `baseline_training/train_baseline.jl` | Phase 1 baseline CNN training loop |
+| `LCNN_training/lcnn_training.jl` | Phase 2/3 L-CNN training loop (gauge links HDF5 + correlator HDF5) |
 
 ## Environment variables
 
@@ -15,7 +16,26 @@
 | `GLARE_TEST_GAUGE_H5` | `A654_gauge_scalar.h5` — scalar gauge HDF5 |
 | `GLARE_TEST_MATRIX_H5` | `A654_gauge_matrix.h5` — matrix gauge HDF5 (Phase 2) |
 | `GLARE_TEST_CORR_H5` | `A654_corr.h5` — correlator HDF5 |
+| `GLARE_LOG_DIR` | Output dir for L-CNN training logs and plots |
 | `GLARE_PLOT_DIR` | Output dir for diagnostic PDFs |
+
+## L-CNN training notes (`LCNN_training/lcnn_training.jl`)
+
+- **W₀ = `plaquette_matrices(U_batch)`** (C_in=6). Never pass raw links as W₀ — see top-level CLAUDE.md.
+- **Spatial crop** (`CROP_S`): set to 12 for CPU training, `Ls` for full-volume eval.
+  Crop is applied after `su3_reconstruct` in `load_one`, before batching.
+- **`model(plaquette_matrices(U_batch), U_batch)`** — plaquettes as W₀, links as transport field U.
+- **GPU support**: `const device = Flux.gpu_device()` at top; `model |> device`, `opt_state`
+  set up after; `U_batch |> device` and `corr |> device` in training loop; `Flux.cpu(pred)`
+  before metric accumulation; `Float64(loss_val)` to extract scalar from GPU.
+- **Checkpointing**: `lcnn_best.jld2` saved whenever val-loss improves; `lcnn_final.jld2`
+  saved unconditionally after last epoch. Both store `Flux.cpu(model)` for portability.
+  Load with `JLD2.load(path)["model"] |> device`.
+- **Run config**: `lcnn_config.toml` written to `LOG_DIR` at the start of every run.
+  Contains lattice dims, split sizes, all hyperparameters, parameter count, device, and
+  output paths. Useful for reproducing runs and post-hoc debugging.
+- **`vol` metadata reading**: `_write_gauge_metadata` stores `lp.iL = (Lx, Ly, Lz, Lt)`.
+  Read as `Lt = vol[4]`, `Ls = vol[1]`. See top-level CLAUDE.md for why `vol[1]` is wrong.
 
 ## Local data paths (CLS A654)
 
@@ -33,12 +53,16 @@ Lattice/data/HVP/LMA/A654_all_t_sources/
 ## CLS A654 lattice parameters
 
 ```julia
-VOL   = (48, 24, 24, 24)   # (T, Lx, Ly, Lz)
-SVOL  = (8, 4, 4, 4)
+VOL   = (24, 24, 24, 48)   # (Lx, Ly, Lz, Lt) — LatticeGPU convention: t at index 4
+SVOL  = (4, 4, 4, 8)
 BC    = BC_PERIODIC
 TWIST = (0, 0, 0, 0, 0, 0)
 lp    = SpaceParm{4}(VOL, SVOL, BC, TWIST)
 ```
+
+**Old wrong convention was `VOL=(48,24,24,24)` (t first).** This gave `lp.iL[4]=24` so only
+24 t-slices were read from CERN files. The training scripts read `Lt = vol[4]`, `Ls = vol[1]`
+from HDF5 metadata — this is correct only for databases built with the right convention above.
 
 ## Recommended server workflow
 

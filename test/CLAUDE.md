@@ -15,6 +15,7 @@ using Pkg; Pkg.test("GLARE")
 | `test_correlator.jl` | `GLARE_TEST_CORR` — LMA root dir (integer subdirs) |
 | `test_dataset.jl` | `GLARE_TEST_CONF`, `GLARE_TEST_CORR` |
 | `test_preprocessing.jl` | `GLARE_TEST_GAUGE_H5` (scalar db), `GLARE_TEST_CORR_H5`; optionally `GLARE_TEST_MATRIX_H5` |
+| `runtest_phase2.jl`     | `GLARE_TEST_CONF` (same as dataset tests) |
 
 All tests skip gracefully with a `@warn` if the required ENV vars are not set.
 

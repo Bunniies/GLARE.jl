@@ -1,60 +1,3 @@
-module Model
-
-using Flux
-using NNlib
-using Statistics
-
-export PeriodicConv4D, build_baseline_cnn, pearson_r, su3_reconstruct
-
-# ---------------------------------------------------------------------------
-# SU(3) matrix reconstruction from 2-row storage
-# ---------------------------------------------------------------------------
-
-"""
-    su3_reconstruct(x) -> Array{Complex{T}, N}
-
-Reconstruct full 3×3 SU(3) matrices from their first-two-row storage format.
-
-Input `x` has shape `(6, rest...)` where dim 1 stores the 6 complex entries
-`[u11, u12, u13, u21, u22, u23]` of each SU(3) matrix (the first two rows).
-This is the layout produced by `build_gauge_matrix_dataset`.
-
-The third row is recovered from the SU(3) unitarity constraint via the
-complex conjugate of the cross product of rows 1 and 2:
-
-```
-u31 = conj(u12*u23 - u13*u22)
-u32 = conj(u13*u21 - u11*u23)
-u33 = conj(u11*u22 - u12*u21)
-```
-
-Output shape is `(3, 3, rest...)` with dim 1 indexing rows and dim 2 columns.
-
-Uses only `cat` and `reshape` — AD-safe under Zygote.
-"""
-function su3_reconstruct(x::AbstractArray{<:Complex})
-    rest = size(x)[2:end]
-    nd   = ndims(x)
-
-    # Slice along dim 1, preserving ndims: shape (1, rest...)
-    _s(i) = x[i:i, ntuple(_ -> Colon(), nd - 1)...]
-
-    u11, u12, u13 = _s(1), _s(2), _s(3)
-    u21, u22, u23 = _s(4), _s(5), _s(6)
-
-    u31 = conj.(u12 .* u23 .- u13 .* u22)
-    u32 = conj.(u13 .* u21 .- u11 .* u23)
-    u33 = conj.(u11 .* u22 .- u12 .* u21)
-
-    # Build each row as (3, rest...) then prepend a row-index dim
-    row1 = reshape(cat(u11, u12, u13; dims=1), 1, 3, rest...)
-    row2 = reshape(cat(u21, u22, u23; dims=1), 1, 3, rest...)
-    row3 = reshape(cat(u31, u32, u33; dims=1), 1, 3, rest...)
-
-    # Stack rows → (3, 3, rest...)
-    return cat(row1, row2, row3; dims=1)
-end
-
 # ---------------------------------------------------------------------------
 # Circular (periodic) padding — 3D spatial only (dims 1,2,3)
 # ---------------------------------------------------------------------------
@@ -178,7 +121,6 @@ function build_baseline_cnn(;
 
     final_ch = in_ch
 
-    # Spatial mean over dims 2, 3, 4 (each of size Ls); temporal is dim 1
     push!(layers,
           x -> dropdims(mean(x, dims = (2, 3, 4)), dims = (2, 3, 4)))  # (Lt, ch, B)
 
@@ -224,5 +166,3 @@ function pearson_r(y_pred::AbstractArray{<:Real, 3},
     end
     return r
 end
-
-end # module Model
