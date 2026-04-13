@@ -258,7 +258,8 @@ Flux.@layer ScalarGate
 function (::ScalarGate)(Φ::AbstractArray{<:Complex})
     # Φ: (3, 3, Lt, Ls, Ls, Ls, C, B)
     # Re(Tr Φ): (Lt, Ls, Ls, Ls, C, B)
-    gate = sigmoid.(_su3_retrace(Φ))
+    gate = sigmoid.(_su3_retrace(Φ)) # sigmoid
+    # gate = relu.(_su3_retrace(Φ)) # relu
     # reshape to (1, 1, Lt, Ls, Ls, Ls, C, B) for broadcasting over matrix dims
     return reshape(gate, 1, 1, size(gate)...) .* Φ
 end

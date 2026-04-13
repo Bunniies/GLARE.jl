@@ -52,7 +52,7 @@ CHANNELS   = [2, 2]         # L-CB block output channels (conservative for memor
 MLP_HIDDEN = 64
 LR         = 3e-3
 EPOCHS     = 10
-BATCH_SIZE = 4              # small: each config ~ 190 MB reconstructed links
+BATCH_SIZE = 1              # small: each config ~ 190 MB reconstructed links
                             # batch=4 ~ 760 MB field tensors before Zygote tape
 
 # ---------------------------------------------------------------------------
@@ -75,7 +75,7 @@ stats = compute_corr_normalization(corr_h5, train_ids; polarizations=POLARIZATIO
 # ---------------------------------------------------------------------------
 # Spatial crop for training — reduces N from 663K to ~24K sites (factor 27x)
 
-CROP_S = 12   # set to Ls for full lattice at eval time
+CROP_S = Ls   # set to Ls for full lattice at eval time
 function random_spatial_crop(U::AbstractArray, crop_s::Int)
     # U: (3, 3, Lt, Ls, Ls, Ls, ndim)
     Ls = size(U, 4)
@@ -139,7 +139,8 @@ model = build_lcnn(;
 # Move model to device. opt_state must be set up AFTER so that optimizer
 # moments live on the same device as the parameters.
 # All parameters are already Float32/ComplexF32 from build_lcnn — no f32 cast needed.
-model     = model |> device
+
+# model     = model |> device # it crashes locally with rosetta
 opt_state = Flux.setup(Adam(LR), model)
 
 n_params = sum(length, Flux.params(model))
@@ -200,14 +201,13 @@ println("Run config written to: $CONFIG_PATH")
 # ---------------------------------------------------------------------------
 # Verify gradients flow through all blocks before training.
 let
-    _Lt, _Ls, _B = 4, 4, 1     # tiny lattice for gradient probe
-    _U = randn(ComplexF32, 3, 3, _Lt, _Ls, _Ls, _Ls, ndim, _B) |> device
-    _fake_corr = randn(Float32, _Lt, npol, _B) |> device
+    # Use a real gauge config so norms are physical (SU(3), not random complex).
+    _U, _corr = load_batch(train_ids[1:1])
+    _U    = _U    |> device
+    _corr = _corr |> device
 
-    # Build a tiny model with same architecture but small spatial dims
     _, _grads = Flux.withgradient(model) do m
-        # Override Lt inside the MLP reshape — use a throw-away model instead
-        W = plaquette_matrices(_U)   # (3,3,_Lt,_Ls,_Ls,_Ls,6,_B)
+        W = plaquette_matrices(_U)
         for blk in m.blocks
             W = blk(W, _U)
         end
