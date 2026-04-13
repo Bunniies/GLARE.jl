@@ -4,6 +4,7 @@ authors = ["Alessandro Conigli <alessandroconigli@gmail.com>"]
 version = "0.1.0"
 
 [deps]
+Adapt = "79e6a3ab-5dfb-504d-930d-738a2a938a0e"
 BDIO = "375f315e-f2c4-11e9-2ef9-134f02f79e27"
 CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
 DelimitedFiles = "8bb1440f-4735-579b-a4ab-409b98df4dab"
