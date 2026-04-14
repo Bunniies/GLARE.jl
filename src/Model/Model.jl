@@ -3,7 +3,7 @@ module Model
 using Flux
 using NNlib
 using Statistics
-using Adapt
+import Flux.Functors
 
 export PeriodicConv4D, build_baseline_cnn, pearson_r   # Phase 1
 export su3_reconstruct, plaquette_matrices                                              # Phase 2 — inputs

@@ -253,8 +253,7 @@ No learnable parameters.
 """
 struct ScalarGate end
 
-Flux.@layer ScalarGate
-Adapt.adapt_structure(to, ::ScalarGate) = ScalarGate()
+Functors.@functor ScalarGate
 
 function (::ScalarGate)(Φ::AbstractArray{<:Complex})
     # Φ: (3, 3, Lt, Ls, Ls, Ls, C, B)
@@ -291,8 +290,7 @@ No learnable parameters.
 """
 struct TracePool end
 
-Flux.@layer TracePool
-Adapt.adapt_structure(to, ::TracePool) = TracePool()
+Functors.@functor TracePool
 
 function (::TracePool)(Φ::AbstractArray{<:Complex})
     # Φ: (3, 3, Lt, Ls, Ls, Ls, C, B)
