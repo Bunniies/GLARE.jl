@@ -55,11 +55,8 @@ docs/                     — Documenter.jl source
 Gauge scalar/link HDF5 builders, correlator builder, 4-way interleaved split,
 z-score normalization, `merge_dataset` for server shards.
 - [ ] Float32 storage in `build_gauge_dataset`
-- [ ] **Rebuild all existing `*_gauge_scalar.h5` and `*_gauge_links.h5` databases.**
-  Old files were built with `VOL=(48,24,24,24)` (wrong — gives `iL[4]=24` so only 24 t-slices
-  were read) and wrong coordinate packing (temporal at last dim instead of first). Shape
-  coincidence `(48,24,24,24,npls)` masked the bug — no error was raised. Correlator DBs are
-  unaffected.
+- [x] **Rebuild `*_gauge_links.h5`** — done (2026-04-15). Old files used `VOL=(48,24,24,24)` (wrong coordinate packing); new database uses correct `VOL=(24,24,24,48)` convention.
+- [ ] **Rebuild `*_gauge_scalar.h5`** — still pending. Same VOL bug applies; scalar DB not yet corrected.
 
 ### Phase 1 — Baseline CNN ✓ (needs rerun)
 `PeriodicConv4D`, `build_baseline_cnn`, `train_baseline.jl`.
@@ -72,7 +69,7 @@ the VOL bug made previous r(t) estimates unreliable. Rebuild scalar DB, then ret
 `su3_reconstruct`, `plaquette_matrices`, `ScalarGate`, `TracePool`, `BilinearLayer`,
 `GaugeEquivConv`, `LCBBlock`, `build_lcnn` / `LCNN`. All layers gauge-equivariant under
 site-dependent V(x). W₀ = plaquette matrices (C_in=6); raw links are NOT valid W₀.
-- [ ] Rebuild `*_gauge_links.h5` (see Phase 0 note above)
+- [x] Rebuild `*_gauge_links.h5` — done (2026-04-15)
 - [ ] Smeared inputs (Stout, ρ=0.1) as additional channels (arXiv:2304.10438 §V)
 - [x] GPU support — `BilinearLayer{A}` and `GaugeEquivConv{A}` parametrised so `Flux.gpu(model)`
   works correctly; `|> device` pattern in both training scripts; `opt_state` set up after
@@ -124,9 +121,7 @@ site-dependent V(x). W₀ = plaquette matrices (C_in=6); raw links are NOT valid
   With correct LatticeGPU convention `lp.iL = (Lx, Ly, Lz, Lt)`, time is at index 4.
   Always read `Lt = vol[4]`, `Ls = vol[1]`. **Never `vol[1]` for `Lt`** — old databases built
   with the wrong `VOL=(48,24,24,24)` had `vol[1]=48=Lt` coincidentally, masking this bug.
-- **L-CNN CPU training: use spatial crop (≥12³).** Full 24³ volume = 663K sites →
-  each gradient step allocates several GB of Zygote tape. Crop to 12³ (6912 sites, noise
-  ratio 1.4× vs full volume) for feasible CPU training. Use full volume at eval time.
+- **Gradient checkpointing in LCNN forward pass.** `Zygote.checkpointed(blk, W, U)` wraps each `LCBBlock` call — Zygote stores only the block input on the tape and reruns the block forward pass during backward. Reduces tape from O(C_in×ndim×volume) to O(volume) per block (~24× inside each block). Cost: ~30-50% more compute per step (block forward runs twice). This enables full 24³×48 training without spatial crop. `TRAIN_CROP_S = Ls` (full volume) is the default; set to e.g. 16 to re-enable cropping if checkpointing is unavailable. `random_spatial_crop` is kept in the training script as a fallback.
 - **LCBBlock:** `BilinearLayer(W_local, W_transported)` — one-link loops at first block;
   each stacked block doubles Wilson loop extent.
 - **Normalization:** corr stats on source-averaged `C̄(t)`, not per-source. Per-config

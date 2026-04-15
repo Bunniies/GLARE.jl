@@ -478,7 +478,7 @@ Flux.@layer LCNN
 function (m::LCNN)(W::AbstractArray{<:Complex, 8},
                     U::AbstractArray{<:Complex, 8})
     for blk in m.blocks
-        W = blk(W, U)
+        W = Zygote.checkpointed(blk, W, U)
     end
     x = m.pool(W)                                   # (Lt, C_last, B)  real
     x = reshape(x, m.Lt * size(x, 2), :)            # (Lt*C_last, B)

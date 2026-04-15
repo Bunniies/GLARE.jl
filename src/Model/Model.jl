@@ -3,6 +3,7 @@ module Model
 using Flux
 using NNlib
 using Statistics
+using Zygote
 import Flux.Functors
 
 export PeriodicConv4D, build_baseline_cnn, pearson_r   # Phase 1

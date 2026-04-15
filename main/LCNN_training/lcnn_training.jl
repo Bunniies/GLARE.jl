@@ -50,7 +50,8 @@ POLARIZATIONS = ["g1-g1", "g2-g2", "g3-g3"]
 C_IN       = ndim * (ndim - 1) ÷ 2   # = 6 for 4D lattice (one per plane)
 CHANNELS   = [2, 2]         # L-CB block output channels (conservative for memory)
 MLP_HIDDEN = 64
-LR         = 3e-3
+LR           = 3e-3
+WEIGHT_DECAY = 1e-4
 EPOCHS     = 10
 BATCH_SIZE = 1              # small: each config ~ 190 MB reconstructed links
                             # batch=4 ~ 760 MB field tensors before Zygote tape
@@ -73,25 +74,27 @@ stats = compute_corr_normalization(corr_h5, train_ids; polarizations=POLARIZATIO
 # ---------------------------------------------------------------------------
 # Data loading helpers
 # ---------------------------------------------------------------------------
-# Spatial crop for training — reduces N from 663K to ~24K sites (factor 27x)
+# Data loading — full volume training enabled by gradient checkpointing in LCNN.
+# random_spatial_crop and TRAIN_CROP_S kept as fallback (set TRAIN_CROP_S < Ls to re-enable).
 
-CROP_S = Ls   # set to Ls for full lattice at eval time
+TRAIN_CROP_S = Ls   # full volume — gradient checkpointing removes the memory constraint.
+                    # set to e.g. 16 to re-enable cropping if checkpointing is not available.
 function random_spatial_crop(U::AbstractArray, crop_s::Int)
     # U: (3, 3, Lt, Ls, Ls, Ls, ndim)
-    Ls = size(U, 4)
-    crop_s == Ls && return U
-    ox = rand(1:(Ls - crop_s + 1))
-    oy = rand(1:(Ls - crop_s + 1))
-    oz = rand(1:(Ls - crop_s + 1))
+    Ls_u = size(U, 4)
+    crop_s == Ls_u && return U
+    ox = rand(1:(Ls_u - crop_s + 1))
+    oy = rand(1:(Ls_u - crop_s + 1))
+    oz = rand(1:(Ls_u - crop_s + 1))
     return U[:, :, :, ox:ox+crop_s-1, oy:oy+crop_s-1, oz:oz+crop_s-1, :]
 end
 # Reconstruct full SU(3) links for one config.
 # load_links returns ComplexF32[6, Lt, Ls, Ls, Ls, ndim].
 # su3_reconstruct returns ComplexF32[3, 3, Lt, Ls, Ls, Ls, ndim].
-function load_one(cid::String)
+function load_one(cid::String; crop_s::Int=Ls)
     raw  = load_links(links_h5, cid)             # (6, Lt, Ls, Ls, Ls, ndim)
     U    = su3_reconstruct(raw)                  # (3, 3, Lt, Ls, Ls, Ls, ndim)
-    U    = random_spatial_crop(U, CROP_S)
+    U    = random_spatial_crop(U, crop_s)
 
     # Source-averaged normalised correlator: (Lt, npol)
     corr2d = Matrix{Float32}(undef, Lt, npol)
@@ -114,11 +117,11 @@ size(Ut)
 #   U_batch :: ComplexF32[3, 3, Lt, Ls, Ls, Ls, ndim, B]   gauge links (for transport)
 #   corr    :: Float32[Lt, npol, B]
 # W₀ = plaquette_matrices(U_batch) — computed at call site, C_in = 6.
-function load_batch(ids::Vector{String})
-    pairs = [load_one(cid) for cid in ids]
-    # U_batch = cat([reshape(p[1], 3, 3, Lt, Ls, Ls, Ls, ndim, 1) for p in pairs]...; dims=8)
-    U_batch = cat([reshape(p[1], 3, 3, Lt, CROP_S, CROP_S, CROP_S, ndim, 1) for p in pairs]...; dims=8)
-
+# crop_s defaults to Ls (full volume). Pass crop_s=TRAIN_CROP_S explicitly if cropping needed.
+function load_batch(ids::Vector{String}; crop_s::Int=Ls)
+    pairs = [load_one(cid; crop_s=crop_s) for cid in ids]
+    cs    = size(pairs[1][1], 4)   # actual spatial size after crop
+    U_batch = cat([reshape(p[1], 3, 3, Lt, cs, cs, cs, ndim, 1) for p in pairs]...; dims=8)
     corr    = cat([reshape(p[2], Lt, npol, 1) for p in pairs]...;  dims=3)
     return U_batch, corr
 end
@@ -141,7 +144,7 @@ model = build_lcnn(;
 # All parameters are already Float32/ComplexF32 from build_lcnn — no f32 cast needed.
 
 # model     = model |> device # it crashes locally with rosetta
-opt_state = Flux.setup(Adam(LR), model)
+opt_state = Flux.setup(Adam(LR, (0.9, 0.999), WEIGHT_DECAY), model)
 
 n_params = sum(length, Flux.params(model))
 @printf("L-CNN: C_in=%d  channels=%s  mlp_hidden=%d  ndim=%d\n",
@@ -170,7 +173,7 @@ open(CONFIG_PATH, "w") do io
     @printf(io, "n_val        = %d\n", length(val_ids))
     @printf(io, "n_test       = %d\n", length(test_ids))
     @printf(io, "n_bc         = %d\n", length(bc_ids))
-    @printf(io, "crop_s       = %d    # spatial crop during training (Ls=%d at eval)\n", CROP_S, Ls)
+    @printf(io, "crop_s       = %d    # spatial crop (Ls=%d = full volume, checkpointing enabled)\n", TRAIN_CROP_S, Ls)
     println(io)
 
     println(io, "[model]")
@@ -182,8 +185,9 @@ open(CONFIG_PATH, "w") do io
     println(io, "[training]")
     @printf(io, "epochs     = %d\n", EPOCHS)
     @printf(io, "batch_size = %d\n", BATCH_SIZE)
-    @printf(io, "lr         = %.2e\n", LR)
-    @printf(io, "optimizer  = \"Adam\"\n")
+    @printf(io, "lr           = %.2e\n", LR)
+    @printf(io, "weight_decay = %.2e\n", WEIGHT_DECAY)
+    @printf(io, "optimizer    = \"Adam\"\n")
     @printf(io, "device     = \"%s\"\n", string(device))
     println(io)
 
@@ -202,7 +206,7 @@ println("Run config written to: $CONFIG_PATH")
 # Verify gradients flow through all blocks before training.
 let
     # Use a real gauge config so norms are physical (SU(3), not random complex).
-    _U, _corr = load_batch(train_ids[1:1])
+    _U, _corr = load_batch(train_ids[1:1]; crop_s=TRAIN_CROP_S)
     _U    = _U    |> device
     _corr = _corr |> device
 
@@ -274,6 +278,7 @@ end
 train_losses  = Float64[]
 val_losses    = Float64[]
 best_val_loss = Inf
+r_midt        = NaN
 
 for epoch in 1:EPOCHS
     perm       = randperm(length(train_ids))
@@ -282,7 +287,7 @@ for epoch in 1:EPOCHS
 
     for start in 1:BATCH_SIZE:length(train_ids)
         batch_ids     = train_ids[perm[start:min(start + BATCH_SIZE - 1, end)]]
-        U_batch, corr = load_batch(batch_ids)
+        U_batch, corr = load_batch(batch_ids; crop_s=TRAIN_CROP_S)
         U_batch       = U_batch |> device
         corr          = corr    |> device
 

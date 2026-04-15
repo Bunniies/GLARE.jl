@@ -47,9 +47,11 @@ Direction→array-dim map: `(4,5,6,3)[mu]` (dim 3=t, dim 4=x, dim 5=y, dim 6=z).
 Call site: `model(plaquette_matrices(U_batch), U_batch)` — plaquettes as W₀, links as U.
 
 **`ScalarGate()`** — `σ(Re(Tr Φ)) ⊙ Φ` (sigmoid gate). No params. Gauge-covariant. Shape preserved. **Must use sigmoid, not relu** — relu causes forward-value explosion across stacked blocks since Re(Tr) is unbounded for non-SU(3) matrices.
+Registered with `Functors.@functor` (NOT `Flux.@layer`) — `Flux.@layer` generates an `adapt_structure` that recurses infinitely on empty structs (no fields → Functors treats the struct itself as a leaf and re-enters). `Functors.@functor` sets `children = (;)` and reconstructs correctly.
 
 **`TracePool()`** — `mean_x Re(Tr Φ(x))`. No params. Gauge-invariant.
 `(3,3,Lt,Ls,Ls,Ls,C,B)` → `(Lt,C,B)`.
+Same `Functors.@functor` registration as `ScalarGate` — same reason.
 
 **`BilinearLayer(C_in1, C_in2, C_out)`** — `Φ_out[i] = Σ_{j,k} α[i,j,k] W_j W'_k`.
 Learnable `α ∈ ℂ^{C_out×C_in1×C_in2}`. Gauge-covariant.

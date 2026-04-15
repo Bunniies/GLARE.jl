@@ -22,8 +22,7 @@
 ## L-CNN training notes (`LCNN_training/lcnn_training.jl`)
 
 - **W₀ = `plaquette_matrices(U_batch)`** (C_in=6). Never pass raw links as W₀ — see top-level CLAUDE.md.
-- **Spatial crop** (`CROP_S`): set to 12 for CPU training, `Ls` for full-volume eval.
-  Crop is applied after `su3_reconstruct` in `load_one`, before batching.
+- **Spatial crop** (`TRAIN_CROP_S`): defaults to `Ls` (full volume) now that gradient checkpointing is enabled in `LCNN`. Set to e.g. 16 to re-enable cropping as a fallback if checkpointing causes issues. `random_spatial_crop` is kept in the script for this purpose.
 - **`model(plaquette_matrices(U_batch), U_batch)`** — plaquettes as W₀, links as transport field U.
 - **GPU support**: `const device = Flux.gpu_device()` at top; `model |> device`, `opt_state`
   set up after; `U_batch |> device` and `corr |> device` in training loop; `Flux.cpu(pred)`
