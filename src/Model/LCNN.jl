@@ -451,11 +451,10 @@ end
 
 function (l::LCBBlock)(W::AbstractArray{<:Complex, 8},
                         U::AbstractArray{<:Complex, 8})
-    # Checkpoint l.conv only: keeps the PT_all accumulation intermediates (O(C_in*ndim*N))
-    # out of the block's local tape while BilinearLayer backward runs. No need to checkpoint
-    # l.bilin — its V/V_right tensors (~12 GB) must exist during bilin backward regardless
-    # (whether prebuilt on tape or rebuilt by a checkpoint re-run), so peak is the same.
-    W_conv = Zygote.checkpointed(l.conv, W, U)
+    # No sub-layer checkpoint: the block-level checkpoint in LCNN already reruns the
+    # entire block during backward, so an inner checkpoint would cause conv to run 4x
+    # (2x from block rerun × 2x from inner rerun). Without it, conv runs 2x total.
+    W_conv = l.conv(W, U)
     W_out  = l.bilin(W, W_conv)
     return l.gate(W_out)
 end
