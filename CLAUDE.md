@@ -81,6 +81,9 @@ site-dependent V(x). W₀ = plaquette matrices (C_in=6); raw links are NOT valid
   saved via JLD2 as `Flux.cpu(model)` for device-agnostic portability.
 - [x] Run config logging: `lcnn_config.toml` written at start of every run with all lattice
   dimensions, hyperparameters, split sizes, parameter count, and output paths.
+- [x] Gradient accumulation: `ACCUM_STEPS` mini-batches accumulated before one optimizer step.
+  Effective batch = `BATCH_SIZE × ACCUM_STEPS`. Keeps peak GPU memory at one config while
+  simulating larger batches. Uses `_add_grads`/`_scale_grads` helpers in `lcnn_training.jl`.
 - [ ] LR schedule (cosine annealing or ReduceLROnPlateau)
 - [ ] r²(t) as primary metric; bias correction at inference
 - [ ] Alternative losses: time-weighted MSE or `L = Σ_t (1 - r(t)²)`
@@ -101,7 +104,12 @@ site-dependent V(x). W₀ = plaquette matrices (C_in=6); raw links are NOT valid
 - **CUDA is a weak dependency only.** `CUDA` declares `__precompile__(false)` — do not
   add as a hard dep. Add as a package extension when GPU kernels are implemented.
 - **L-CNN tensor layout:** `(3, 3, Lt, Ls, Ls, Ls, C, B)` — matrix indices first.
-- **BilinearLayer:** use `(1,1,C_out,1) .* (3,3,1,N)` broadcasting, not `cat` on channels.
+- **BilinearLayer uses two-step batched matmul contraction.** Step 1: contract `α` with `W'`
+  via a single matrix multiply `(C_out*C_in1, C_in2) × (C_in2, 9N)`. Step 2: contract
+  `W` with the result via `batched_mul` over fused `(c,j)` index. This gives O(1) Zygote
+  nodes instead of the O(C_in1×C_in2) from a `sum()` generator. The old `sum()` approach
+  stored `C_in1×C_in2` arrays of shape `(3,3,C_out,N)` on the tape — catastrophic for
+  full volume (e.g. 64 × 9 × 16 × 663K × 8 bytes ≈ 49 GB).
 - **W₀ must be plaquette matrices, not raw links.** Links transform as `V(x) U_μ(x) V†(x+μ̂)`
   (different sites on left/right) — NOT gauge-covariant. Use `plaquette_matrices(U_batch)`
   to get `P_μν(x) → V(x) P V†(x)` (C_in=6). Passing links as W₀ silently breaks all
@@ -109,6 +117,14 @@ site-dependent V(x). W₀ = plaquette matrices (C_in=6); raw links are NOT valid
 - **`plaquette_matrices` must not use `push!`.** Called inside `withgradient`, so Zygote
   differentiates through it. Use explicit `cat(_plane(4,1), ..., _plane(2,1); dims=7)` —
   no mutation, AD-safe. A `push!(planes, ...)` loop triggers "Mutating arrays not supported".
+- **GaugeEquivConv uses `Zygote.Buffer` for transport stacking.** All `_pt_fwd`/`_pt_bwd`
+  results are written to a pre-sized `Buffer(W, 3, 3, n_ch, N)`, then `copy(buf)` gives
+  `PT_all`. This is O(C_in×ndim×N) memory — linear. Do NOT use sequential `cat` in a
+  for-loop (`PT_all = cat(PT_all, new; dims=3)`): Zygote stores every growing intermediate,
+  giving O((C_in×ndim)² × N) — quadratic and catastrophic for full volume. Array
+  comprehensions (`[f(j,mu) for j in ..., mu in ...]`) also fail: `push!` internally.
+  `Zygote.Buffer` is the only Zygote-safe pattern for building an array of runtime-determined
+  size from a loop.
 - **`plaquette_matrices` direction convention:** LatticeGPU uses `1=x, 2=y, 3=z, 4=t`.
   Array layout is `(3,3,Lt,Ls,Ls,Ls,B)` with `dim 3=t, dim 4=x, dim 5=y, dim 6=z`.
   The direction→dim map is `(4,5,6,3)[mu]` — direction 4(t)→dim3, 1(x)→dim4, 2(y)→dim5, 3(z)→dim6.
@@ -121,7 +137,19 @@ site-dependent V(x). W₀ = plaquette matrices (C_in=6); raw links are NOT valid
   With correct LatticeGPU convention `lp.iL = (Lx, Ly, Lz, Lt)`, time is at index 4.
   Always read `Lt = vol[4]`, `Ls = vol[1]`. **Never `vol[1]` for `Lt`** — old databases built
   with the wrong `VOL=(48,24,24,24)` had `vol[1]=48=Lt` coincidentally, masking this bug.
-- **Gradient checkpointing in LCNN forward pass.** `Zygote.checkpointed(blk, W, U)` wraps each `LCBBlock` call — Zygote stores only the block input on the tape and reruns the block forward pass during backward. Reduces tape from O(C_in×ndim×volume) to O(volume) per block (~24× inside each block). Cost: ~30-50% more compute per step (block forward runs twice). This enables full 24³×48 training without spatial crop. `TRAIN_CROP_S = Ls` (full volume) is the default; set to e.g. 16 to re-enable cropping if checkpointing is unavailable. `random_spatial_crop` is kept in the training script as a fallback.
+- **Two-level gradient checkpointing in LCNN/LCBBlock.**
+  - *Block level* (`LCNN`): `Zygote.checkpointed(blk, W, U)` wraps each `LCBBlock` —
+    stores only the block input W on the tape, reruns the block forward during backward.
+    Eliminates inter-block tape.
+  - *Sub-layer level* (`LCBBlock`): `Zygote.checkpointed(l.conv, W, U)` wraps only
+    `GaugeEquivConv` inside each block. Keeps the conv's `Zygote.Buffer` intermediates
+    (~2-5 GB) out of memory while `BilinearLayer` backward runs (~12-15 GB peak).
+    `BilinearLayer` is NOT checkpointed — its peak is the same whether prebuilt or
+    rebuilt (V and V_right must exist during bilin backward regardless).
+  - Cost: ~30-50% more compute per step (each checkpointed layer's forward runs twice).
+  - Full 24³×48 training fits on 80 GB GPU with `channels=[8,16]` (peak ~15 GB per block).
+  - `TRAIN_CROP_S = Ls` (full volume) is the default; set to e.g. 16 to re-enable
+    cropping if checkpointing is unavailable. `random_spatial_crop` kept as fallback.
 - **LCBBlock:** `BilinearLayer(W_local, W_transported)` — one-link loops at first block;
   each stacked block doubles Wilson loop extent.
 - **Normalization:** corr stats on source-averaged `C̄(t)`, not per-source. Per-config

@@ -27,6 +27,10 @@
 - **GPU support**: `const device = Flux.gpu_device()` at top; `model |> device`, `opt_state`
   set up after; `U_batch |> device` and `corr |> device` in training loop; `Flux.cpu(pred)`
   before metric accumulation; `Float64(loss_val)` to extract scalar from GPU.
+- **Gradient accumulation**: `ACCUM_STEPS` mini-batches processed one at a time; gradients
+  accumulated via `_add_grads` (recursive NamedTuple/Vector/Array tree addition) and averaged
+  with `_scale_grads` before a single `Flux.update!`. Effective batch = `BATCH_SIZE × ACCUM_STEPS`.
+  Peak GPU memory stays at one config regardless of `ACCUM_STEPS`.
 - **Checkpointing**: `lcnn_best.jld2` saved whenever val-loss improves; `lcnn_final.jld2`
   saved unconditionally after last epoch. Both store `Flux.cpu(model)` for portability.
   Load with `JLD2.load(path)["model"] |> device`.

@@ -212,14 +212,27 @@ function (l::BilinearLayer)(W::AbstractArray{<:Complex, 8},
     W_flat  = reshape(permutedims(W,  (1, 2, 7, 3, 4, 5, 6, 8)), 3, 3, C_in1, N)
     W′_flat = reshape(permutedims(W′, (1, 2, 7, 3, 4, 5, 6, 8)), 3, 3, C_in2, N)
 
-    # For each (j,k) pair: broadcast α[:,j,k] over the batched matrix product W_j * W'_k
-    # α[:,j,k]: (C_out,) → (1, 1, C_out, 1)   product: (3, 3, N) → (3, 3, 1, N)
-    # Result per pair: (3, 3, C_out, N); sum over all (j,k) → (3, 3, C_out, N)
-    out_4d = sum(
-        reshape(l.α[:, j, k], 1, 1, C_out, 1) .*
-        reshape(NNlib.batched_mul(W_flat[:, :, j, :], W′_flat[:, :, k, :]), 3, 3, 1, N)
-        for j in 1:C_in1, k in 1:C_in2
-    )
+    # Two-step batched contraction — O(1) Zygote nodes instead of C_in1*C_in2.
+    #
+    # Step 1: contract α with W' to build V[c,b,i,j,n] = Σ_k α[i,j,k] * W'[c,b,k,n]
+    #   α:      (C_out, C_in1, C_in2) → reshape (C_out*C_in1, C_in2)   [i varies fastest]
+    #   W'_flat: (3, 3, C_in2, N) → permute(3,1,2,4) (C_in2,3,3,N) → reshape (C_in2, 9*N)
+    #   product: (C_out*C_in1, 9*N) → reshape (C_out, C_in1, 3, 3, N) → permute (3,4,1,2,5)
+    #   V:       (3, 3, C_out, C_in1, N)
+    α_mat  = reshape(l.α, C_out * C_in1, C_in2)
+    W′_mat = reshape(permutedims(W′_flat, (3, 1, 2, 4)), C_in2, 9 * N)
+    V      = permutedims(reshape(α_mat * W′_mat, C_out, C_in1, 3, 3, N), (3, 4, 1, 2, 5))
+    # V: (3, 3, C_out, C_in1, N)  i.e. (c, b, i, j, n)
+
+    # Step 2: contract W with V via batched_mul
+    #   out[a,b,i,n] = Σ_{c,j} W[a,c,j,n] * V[c,b,i,j,n]
+    #   Fold (c,j) into one index p (c varies fastest):
+    #   W_left:  (3, 3*C_in1, N)        — reshape(W_flat, 3, 3*C_in1, N)
+    #   V_right: (3*C_in1, 3*C_out, N)  — permute V(c,b,i,j,n)→(c,j,b,i,n) → reshape
+    #   batched_mul → (3, 3*C_out, N) → reshape (3, 3, C_out, N)
+    W_left  = reshape(W_flat, 3, 3 * C_in1, N)
+    V_right = reshape(permutedims(V, (1, 4, 2, 3, 5)), 3 * C_in1, 3 * C_out, N)
+    out_4d  = reshape(NNlib.batched_mul(W_left, V_right), 3, 3, C_out, N)
 
     # Restore layout: (3, 3, C_out, N) → (3, 3, C_out, Lt, Ls, Ls, Ls, B) → (3, 3, Lt, Ls, Ls, Ls, C_out, B)
     out_8d = reshape(out_4d, 3, 3, C_out, sz[3], sz[4], sz[5], sz[6], sz[8])
@@ -358,24 +371,31 @@ function (l::GaugeEquivConv)(W::AbstractArray{<:Complex, 8},
     ndim  = size(l.omega, 3)
     N     = sz[3] * sz[4] * sz[5] * sz[6] * sz[8]   # Lt*Ls³*B
 
-    # For each (j, μ): compute fwd and bwd parallel transports, weight by omega,
-    # accumulate. Uses sum() comprehension — functional and AD-safe (same pattern
-    # as BilinearLayer).
-    out_4d = sum(
-        begin
-            mu_dim = (4, 5, 6, 3)[mu]  # LatticeGPU dir (1=x,2=y,3=z,4=t) → array dim (3=t,4=x,5=y,6=z)
-            U_mu   = U[:, :, :, :, :, :, mu, :]   # (3, 3, Lt, Ls, Ls, Ls, B)
-            W_j    = W[:, :, :, :, :, :, j,  :]   # (3, 3, Lt, Ls, Ls, Ls, B)
-            PT_f   = _pt_fwd(U_mu, W_j, mu_dim)   # (3, 3, Lt, Ls, Ls, Ls, B)
-            PT_b   = _pt_bwd(U_mu, W_j, mu_dim)   # (3, 3, Lt, Ls, Ls, Ls, B)
-            # omega[:,j,mu,1/2]: (C_out,) → (1, 1, C_out, 1) for broadcasting
-            reshape(l.omega[:, j, mu, 1], 1, 1, C_out, 1) .*
-                reshape(PT_f, 3, 3, 1, N) .+
-            reshape(l.omega[:, j, mu, 2], 1, 1, C_out, 1) .*
-                reshape(PT_b, 3, 3, 1, N)
-        end
-        for j in 1:C_in, mu in 1:ndim
-    )   # → (3, 3, C_out, N)
+    # Build PT_all using Zygote.Buffer — O(C_in*ndim*N) memory, no quadratic
+    # cat chain. Each transport is written to a pre-sized buffer slot; copy(buf)
+    # produces the final array. Zygote records each slice assignment and
+    # distributes gradients back to the individual transports.
+    n_ch = C_in * ndim * 2
+    buf  = Zygote.Buffer(W, 3, 3, n_ch, N)
+    for j in 1:C_in, mu in 1:ndim
+        mu_dim = (4, 5, 6, 3)[mu]
+        U_mu   = U[:, :, :, :, :, :, mu, :]
+        W_j    = W[:, :, :, :, :, :, j,  :]
+        p      = (j - 1) * ndim + mu   # pair index, 1-based
+        buf[:, :, 2p-1, :] = reshape(_pt_fwd(U_mu, W_j, mu_dim), 3, 3, N)
+        buf[:, :, 2p,   :] = reshape(_pt_bwd(U_mu, W_j, mu_dim), 3, 3, N)
+    end
+    PT_all = copy(buf)   # (3, 3, C_in*ndim*2, N)
+
+    # Contract with omega via a single matrix multiply.
+    # Channel ordering: p(j,mu) with channels 2p-1(fwd), 2p(bwd).
+    # 0-indexed: (dir-1) + 2*(mu-1) + 2*ndim*(j-1)  [dir fastest, mu next, j slowest].
+    # omega permuted to (C_out, dir, mu, j) so reshape matches this ordering.
+    omega_mat = reshape(permutedims(l.omega, (1, 4, 3, 2)), C_out, n_ch)
+    # PT_all: (3,3,C_in*ndim*2,N) → permute(3,1,2,4) → (C_in*ndim*2, 3, 3, N) → reshape (C_in*ndim*2, 9*N)
+    PT_mat    = reshape(permutedims(PT_all, (3, 1, 2, 4)), C_in * ndim * 2, 9 * N)
+    # (C_out, C_in*ndim*2) × (C_in*ndim*2, 9*N) → (C_out, 9*N) → (C_out,3,3,N) → (3,3,C_out,N)
+    out_4d    = permutedims(reshape(omega_mat * PT_mat, C_out, 3, 3, N), (2, 3, 1, 4))
 
     # (3, 3, C_out, N) → (3, 3, C_out, Lt, Ls, Ls, Ls, B) → (3, 3, Lt, Ls, Ls, Ls, C_out, B)
     out_8d = reshape(out_4d, 3, 3, C_out, sz[3], sz[4], sz[5], sz[6], sz[8])
@@ -431,8 +451,13 @@ end
 
 function (l::LCBBlock)(W::AbstractArray{<:Complex, 8},
                         U::AbstractArray{<:Complex, 8})
-    W_conv = l.conv(W, U)
-    return l.gate(l.bilin(W, W_conv))
+    # Checkpoint l.conv only: keeps the PT_all accumulation intermediates (O(C_in*ndim*N))
+    # out of the block's local tape while BilinearLayer backward runs. No need to checkpoint
+    # l.bilin — its V/V_right tensors (~12 GB) must exist during bilin backward regardless
+    # (whether prebuilt on tape or rebuilt by a checkpoint re-run), so peak is the same.
+    W_conv = Zygote.checkpointed(l.conv, W, U)
+    W_out  = l.bilin(W, W_conv)
+    return l.gate(W_out)
 end
 
 # ---------------------------------------------------------------------------

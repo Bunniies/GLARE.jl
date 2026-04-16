@@ -55,17 +55,29 @@ Same `Functors.@functor` registration as `ScalarGate` — same reason.
 
 **`BilinearLayer(C_in1, C_in2, C_out)`** — `Φ_out[i] = Σ_{j,k} α[i,j,k] W_j W'_k`.
 Learnable `α ∈ ℂ^{C_out×C_in1×C_in2}`. Gauge-covariant.
-Use `(1,1,C_out,1) .* (3,3,1,N)` broadcasting — do NOT use `cat` across channel dim.
+Two-step batched matmul contraction (O(1) Zygote nodes):
+Step 1: `V[c,b,i,j,n] = Σ_k α[i,j,k] * W'[c,b,k,n]` — single `*` on reshaped matrices.
+Step 2: `out[a,b,i,n] = Σ_{c,j} W[a,c,j,n] * V[c,b,i,j,n]` — single `batched_mul` over fused `(c,j)`.
+Do NOT use `sum()` generator over `(j,k)` pairs — Zygote stores all `C_in1×C_in2` weighted
+products on the tape (each `(3,3,C_out,N)`), causing OOM at full volume.
 
 **`GaugeEquivConv(C_in, C_out; ndim=4)`** — L-Conv (arXiv:2012.12901 Eq. 5).
 `Φ_out[i,x] = Σ_{j,μ} [ω[i,j,μ,1] PT_fwd + ω[i,j,μ,2] PT_bwd]`.
 Learnable `ω ∈ ℝ^{C_out×C_in×ndim×2}`. Gauge-equivariant under site-dependent V(x).
 Inputs: `W (3,3,...,C_in,B)`, `U (3,3,...,ndim,B)`. Output: `(3,3,...,C_out,B)`.
 Direction→dim map: `(4,5,6,3)[mu]` (LatticeGPU 1=x,2=y,3=z,4=t → array dim 4,5,6,3). **NOT `mu+2`.**
+Uses `Zygote.Buffer(W, 3, 3, n_ch, N)` to stack all `C_in×ndim×2` transport results into
+`PT_all` with O(linear) memory. Then contracts with `ω` via single `omega_mat * PT_mat`.
+`omega` permuted `(1,4,3,2)` → `(C_out, dir, mu, j)` to match Buffer channel ordering
+`p = (dir-1) + 2*(mu-1) + 2*ndim*(j-1)`. Do NOT use sequential `cat` in a for-loop
+(quadratic tape) or array comprehensions (`push!` breaks Zygote).
 
 **`LCBBlock(C_in, C_conv, C_out; ndim=4)`** — `GaugeEquivConv → BilinearLayer(W, W_conv) → ScalarGate`.
 `BilinearLayer` takes `(W_local, W_transported)` — creates one-link Wilson loops per block;
 each stacked block doubles the loop extent.
+`l.conv` is wrapped in `Zygote.checkpointed` — keeps transport intermediates (~2-5 GB) out of
+memory while bilin backward runs. `l.bilin` is NOT checkpointed (peak is the same either way
+since V/V_right must exist during bilin backward regardless).
 
 **`build_lcnn(; Lt=48, C_in=6, ndim=4, channels=[4,4], npol=3, mlp_hidden=64)`** → `LCNN`
 `n` L-CB blocks → `TracePool` → MLP → `(Lt,npol,B)`. Same output signature as `build_baseline_cnn`.

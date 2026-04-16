@@ -1,5 +1,6 @@
 using GLARE
 using Flux
+using Zygote
 using HDF5
 using JLD2
 using Statistics
@@ -55,6 +56,9 @@ WEIGHT_DECAY = 1e-4
 EPOCHS     = 10
 BATCH_SIZE = 1              # small: each config ~ 190 MB reconstructed links
                             # batch=4 ~ 760 MB field tensors before Zygote tape
+ACCUM_STEPS = 4             # gradient accumulation: effective batch = BATCH_SIZE * ACCUM_STEPS
+                            # each forward/backward processes BATCH_SIZE configs; gradients
+                            # are averaged over ACCUM_STEPS steps before one optimizer update.
 
 # ---------------------------------------------------------------------------
 # Data split
@@ -185,6 +189,8 @@ open(CONFIG_PATH, "w") do io
     println(io, "[training]")
     @printf(io, "epochs     = %d\n", EPOCHS)
     @printf(io, "batch_size = %d\n", BATCH_SIZE)
+    @printf(io, "accum_steps = %d    # effective batch = batch_size × accum_steps = %d\n",
+            ACCUM_STEPS, BATCH_SIZE * ACCUM_STEPS)
     @printf(io, "lr           = %.2e\n", LR)
     @printf(io, "weight_decay = %.2e\n", WEIGHT_DECAY)
     @printf(io, "optimizer    = \"Adam\"\n")
@@ -213,7 +219,7 @@ let
     _, _grads = Flux.withgradient(model) do m
         W = plaquette_matrices(_U)
         for blk in m.blocks
-            W = blk(W, _U)
+            W = Zygote.checkpointed(blk, W, _U)
         end
         x = m.pool(W)
         mean(x.^2)   # just check grads flow; skip MLP (different Lt)
@@ -263,11 +269,37 @@ end
         # mse_loss(model(_U0, _U0), _c0))
 
 # ---------------------------------------------------------------------------
+# Gradient accumulation helpers
+# ---------------------------------------------------------------------------
+
+# Add two gradient trees element-wise (matching Flux's nested NamedTuple/Vector structure).
+function _add_grads(g1, g2)
+    g1 === nothing && return g2
+    g2 === nothing && return g1
+    g1 isa NamedTuple && return NamedTuple{keys(g1)}(map(k -> _add_grads(g1[k], g2[k]), keys(g1)))
+    g1 isa AbstractVector && return [_add_grads(g1[i], g2[i]) for i in eachindex(g1)]
+    g1 isa Tuple && return ntuple(i -> _add_grads(g1[i], g2[i]), length(g1))
+    g1 isa AbstractArray && return g1 .+ g2
+    return g1
+end
+
+# Scale all gradient arrays by a scalar factor.
+function _scale_grads(g, s::Real)
+    g === nothing && return nothing
+    g isa NamedTuple && return NamedTuple{keys(g)}(map(k -> _scale_grads(g[k], s), keys(g)))
+    g isa AbstractVector && return [_scale_grads(g[i], s) for i in eachindex(g)]
+    g isa Tuple && return ntuple(i -> _scale_grads(g[i], s), length(g))
+    g isa AbstractArray && return g .* s
+    return g
+end
+
+# ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
 
 println("\n--- Training L-CNN ---")
-@printf("Epochs: %d  |  Batch: %d  |  LR: %.0e\n", EPOCHS, BATCH_SIZE, LR)
+@printf("Epochs: %d  |  Batch: %d × %d accum  |  LR: %.0e\n",
+        EPOCHS, BATCH_SIZE, ACCUM_STEPS, LR)
 @printf("Channels: %s  |  MLP hidden: %d\n\n", string(CHANNELS), MLP_HIDDEN)
 
 log_path = joinpath(LOG_DIR, "lcnn_training_log.csv")
@@ -285,19 +317,37 @@ for epoch in 1:EPOCHS
     epoch_loss = 0.0
     n_batches  = 0
 
-    for start in 1:BATCH_SIZE:length(train_ids)
-        batch_ids     = train_ids[perm[start:min(start + BATCH_SIZE - 1, end)]]
-        U_batch, corr = load_batch(batch_ids; crop_s=TRAIN_CROP_S)
-        U_batch       = U_batch |> device
-        corr          = corr    |> device
+    # Gradient accumulation: process ACCUM_STEPS mini-batches of BATCH_SIZE configs
+    # each, accumulate gradients, then apply one averaged optimizer step.
+    step_size = BATCH_SIZE * ACCUM_STEPS
+    for start in 1:step_size:length(train_ids)
+        accum_grad   = nothing
+        accum_loss   = 0.0
+        actual_steps = 0
 
-        loss_val, grads = Flux.withgradient(model) do m
-            mse_loss(m(plaquette_matrices(U_batch), U_batch), corr)
+        for step in 0:ACCUM_STEPS-1
+            idx = start + step * BATCH_SIZE
+            idx > length(train_ids) && break
+
+            batch_ids     = train_ids[perm[idx:min(idx + BATCH_SIZE - 1, length(train_ids))]]
+            U_batch, corr = load_batch(batch_ids; crop_s=TRAIN_CROP_S)
+            U_batch       = U_batch |> device
+            corr          = corr    |> device
+
+            loss_val, grads = Flux.withgradient(model) do m
+                mse_loss(m(plaquette_matrices(U_batch), U_batch), corr)
+            end
+
+            accum_loss  += Float64(loss_val)
+            accum_grad   = _add_grads(accum_grad, grads[1])
+            actual_steps += 1
         end
 
-        Flux.update!(opt_state, model, grads[1])
-        epoch_loss += Float64(loss_val)
-        n_batches  += 1
+        if actual_steps > 0
+            Flux.update!(opt_state, model, _scale_grads(accum_grad, 1.0f0 / actual_steps))
+            epoch_loss += accum_loss / actual_steps
+            n_batches  += 1
+        end
     end
 
     train_loss         = epoch_loss / n_batches
