@@ -137,15 +137,15 @@ site-dependent V(x). W₀ = plaquette matrices (C_in=6); raw links are NOT valid
   With correct LatticeGPU convention `lp.iL = (Lx, Ly, Lz, Lt)`, time is at index 4.
   Always read `Lt = vol[4]`, `Ls = vol[1]`. **Never `vol[1]` for `Lt`** — old databases built
   with the wrong `VOL=(48,24,24,24)` had `vol[1]=48=Lt` coincidentally, masking this bug.
-- **Block-level gradient checkpointing in LCNN.**
+- **Two-level gradient checkpointing in LCNN/LCBBlock.**
   - *Block level* (`LCNN`): `Zygote.checkpointed(blk, W, U)` wraps each `LCBBlock` —
     stores only the block input W on the tape, reruns the block forward during backward.
     Eliminates inter-block tape.
-  - *Sub-layer level* (`LCBBlock`): **removed** — previously `Zygote.checkpointed(l.conv, W, U)`
-    wrapped `GaugeEquivConv`, but combined with the block-level checkpoint this caused conv
-    to run 4x (2x block rerun × 2x inner rerun). Now conv runs directly, 2x total.
-    Re-enable in `LCBBlock` if GPU memory becomes tight without it.
-  - Cost: ~30-50% more compute per step (block-level checkpoint reruns each block's forward once).
+  - *Sub-layer level* (`LCBBlock`): `Zygote.checkpointed(l.conv, W, U)` wraps
+    `GaugeEquivConv` inside each block. Keeps the conv's `Zygote.Buffer` intermediates
+    off the tape while `BilinearLayer` backward runs, reducing peak GPU memory.
+  - Cost: conv runs 3x total (1x forward, 1x block rerun, 1x inner rerun during block
+    rerun's backward). ~50% more compute per step.
   - Full 24³×48 training fits on 80 GB GPU with `channels=[8,16]` (peak ~15 GB per block).
   - `TRAIN_CROP_S = Ls` (full volume) is the default; set to e.g. 16 to re-enable
     cropping if checkpointing is unavailable. `random_spatial_crop` kept as fallback.

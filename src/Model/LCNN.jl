@@ -451,10 +451,12 @@ end
 
 function (l::LCBBlock)(W::AbstractArray{<:Complex, 8},
                         U::AbstractArray{<:Complex, 8})
-    # No sub-layer checkpoint: the block-level checkpoint in LCNN already reruns the
-    # entire block during backward, so an inner checkpoint would cause conv to run 4x
-    # (2x from block rerun × 2x from inner rerun). Without it, conv runs 2x total.
-    W_conv = l.conv(W, U)
+    # Checkpoint l.conv: keeps PT_all and Buffer intermediates (O(C_in*ndim*N)) off the
+    # tape while BilinearLayer backward runs, reducing peak GPU memory. With block-level
+    # checkpoint in LCNN, conv runs 3x total (1x forward + 1x block rerun + 1x inner
+    # rerun during block rerun's backward). Without this, conv intermediates stay live
+    # and can push peak memory over GPU limits.
+    W_conv = Zygote.checkpointed(l.conv, W, U)
     W_out  = l.bilin(W, W_conv)
     return l.gate(W_out)
 end

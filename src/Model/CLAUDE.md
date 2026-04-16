@@ -75,9 +75,9 @@ Uses `Zygote.Buffer(W, 3, 3, n_ch, N)` to stack all `C_in×ndim×2` transport re
 **`LCBBlock(C_in, C_conv, C_out; ndim=4)`** — `GaugeEquivConv → BilinearLayer(W, W_conv) → ScalarGate`.
 `BilinearLayer` takes `(W_local, W_transported)` — creates one-link Wilson loops per block;
 each stacked block doubles the loop extent.
-`l.conv` runs directly (no sub-layer checkpoint) — the block-level checkpoint in `LCNN` already
-reruns the block during backward; an inner checkpoint would cause conv to run 4x total.
-Re-enable `Zygote.checkpointed(l.conv, W, U)` if GPU memory is tight without it.
+`l.conv` is wrapped in `Zygote.checkpointed` — keeps transport intermediates off the
+tape while bilin backward runs, reducing peak GPU memory. With block-level checkpoint,
+conv runs 3x total (1x forward, 1x block rerun, 1x inner rerun during block rerun's backward).
 
 **`build_lcnn(; Lt=48, C_in=6, ndim=4, channels=[4,4], npol=3, mlp_hidden=64)`** → `LCNN`
 `n` L-CB blocks → `TracePool` → MLP → `(Lt,npol,B)`. Same output signature as `build_baseline_cnn`.
