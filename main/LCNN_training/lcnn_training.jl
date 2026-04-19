@@ -8,6 +8,7 @@ using Printf
 using Random
 using LinearAlgebra
 using PyPlot
+using TimerOutputs
 
 # ---------------------------------------------------------------------------
 # Device selection — GPU if available, CPU otherwise.
@@ -92,30 +93,59 @@ function random_spatial_crop(U::AbstractArray, crop_s::Int)
     oz = rand(1:(Ls_u - crop_s + 1))
     return U[:, :, :, ox:ox+crop_s-1, oy:oy+crop_s-1, oz:oz+crop_s-1, :]
 end
-# Reconstruct full SU(3) links for one config.
-# load_links returns ComplexF32[6, Lt, Ls, Ls, Ls, ndim].
-# su3_reconstruct returns ComplexF32[3, 3, Lt, Ls, Ls, Ls, ndim].
-function load_one(cid::String; crop_s::Int=Ls)
-    raw  = load_links(links_h5, cid)             # (6, Lt, Ls, Ls, Ls, ndim)
-    U    = su3_reconstruct(raw)                  # (3, 3, Lt, Ls, Ls, Ls, ndim)
-    U    = random_spatial_crop(U, crop_s)
 
-    # Source-averaged normalised correlator: (Lt, npol)
-    corr2d = Matrix{Float32}(undef, Lt, npol)
+# ---------------------------------------------------------------------------
+# Preload all data into CPU memory (one-time cost).
+# Avoids repeated HDF5 open/read/close during training — dominant I/O bottleneck.
+# With 1.6 TB CPU RAM, 400 configs × ~191 MB reconstructed ≈ 76 GB is fine.
+# ---------------------------------------------------------------------------
+
+println("Preloading all data into CPU memory...")
+@timeit GLARE_TIMER "preload" begin
+    # Collect all config ids that will be needed (train + val + test)
+    all_ids = unique(vcat(train_ids, val_ids, test_ids))
+
+    # Pre-read correlators: open file once, read all configs
+    CORR_CACHE = Dict{String, Matrix{Float32}}()
+    @timeit GLARE_TIMER "preload_corr" begin
     h5open(corr_h5, "r") do fid
-        for (ipol, pol) in enumerate(POLARIZATIONS)
-            co   = read(fid["configs"][cid][pol]["correlator"])   # (Lt, nsrcs)
-            cbar = vec(mean(co, dims=2))
-            for t in 1:Lt
-                corr2d[t, ipol] = Float32((cbar[t] - stats.corr_mean[t]) / stats.corr_std[t])
+        for cid in all_ids
+            corr2d = Matrix{Float32}(undef, Lt, npol)
+            for (ipol, pol) in enumerate(POLARIZATIONS)
+                co   = read(fid["configs"][cid][pol]["correlator"])   # (Lt, nsrcs)
+                cbar = vec(mean(co, dims=2))
+                for t in 1:Lt
+                    corr2d[t, ipol] = Float32((cbar[t] - stats.corr_mean[t]) / stats.corr_std[t])
+                end
+            end
+            CORR_CACHE[cid] = corr2d
+        end
+    end
+    end # preload_corr
+
+    # Pre-read and reconstruct gauge links: open file once, su3_reconstruct once per config
+    LINKS_CACHE = Dict{String, Array{ComplexF32, 7}}()
+    @timeit GLARE_TIMER "preload_links" begin
+    h5open(links_h5, "r") do fid
+        for (i, cid) in enumerate(all_ids)
+            raw = read(fid["configs"][cid]["gauge_links"])   # ComplexF32[6, Lt, Ls, Ls, Ls, ndim]
+            LINKS_CACHE[cid] = su3_reconstruct(raw)          # ComplexF32[3, 3, Lt, Ls, Ls, Ls, ndim]
+            if i % 50 == 0
+                @printf("  preloaded %d / %d configs\n", i, length(all_ids))
             end
         end
     end
-    return U, corr2d
+    end # preload_links
+end # preload
+@printf("Preload complete: %d configs (links: %.1f GB)\n",
+        length(all_ids),
+        sum(sizeof(v) for v in values(LINKS_CACHE)) / 1e9)
+
+# Fast data access from cache (no HDF5 I/O, no su3_reconstruct)
+function load_one(cid::String; crop_s::Int=Ls)
+    U = random_spatial_crop(LINKS_CACHE[cid], crop_s)
+    return U, CORR_CACHE[cid]
 end
-Ut, _ = load_one("1") ;
-@show eltype(Ut) # should be ComplexF32 not ComplexF64
-size(Ut)
 
 # Batch loader: returns
 #   U_batch :: ComplexF32[3, 3, Lt, Ls, Ls, Ls, ndim, B]   gauge links (for transport)
@@ -215,9 +245,10 @@ let
     _U, _corr = load_batch(train_ids[1:1]; crop_s=TRAIN_CROP_S)
     _U    = _U    |> device
     _corr = _corr |> device
+    _W    = plaquette_matrices(_U)
 
     _, _grads = Flux.withgradient(model) do m
-        W = plaquette_matrices(_U)
+        W = _W
         for blk in m.blocks
             W = Zygote.checkpointed(blk, W, _U)
         end
@@ -234,6 +265,20 @@ let
     end
 end
 
+# ---------------------------------------------------------------------------
+# Per-layer forward profiling (no AD — gives layer-by-layer breakdown)
+# ---------------------------------------------------------------------------
+println("\n--- Forward pass profiling (1 config, no AD) ---")
+let
+    _U, _ = load_batch(train_ids[1:1]; crop_s=TRAIN_CROP_S)
+    _U    = _U |> device
+    reset_timer!(GLARE_TIMER)
+    profile_forward(model, _U)
+    print_timer(GLARE_TIMER; sortby=:time)
+    reset_timer!(GLARE_TIMER)
+end
+println()
+
 ##
 # ---------------------------------------------------------------------------
 # Loss and evaluation
@@ -242,6 +287,7 @@ end
 mse_loss(ŷ, y) = mean((ŷ .- y).^2)
 
 function evaluate(model, ids; batch_size=BATCH_SIZE)
+    @timeit GLARE_TIMER "evaluate" begin
     total_loss = 0.0
     n_batches  = 0
     all_pred   = Array{Float32}(undef, Lt, npol, 0)
@@ -249,9 +295,10 @@ function evaluate(model, ids; batch_size=BATCH_SIZE)
 
     for start in 1:batch_size:length(ids)
         batch_ids     = ids[start:min(start + batch_size - 1, end)]
-        U_batch, corr = load_batch(batch_ids)
+        U_batch, corr = @timeit GLARE_TIMER "eval_load_batch" load_batch(batch_ids)
         U_d           = U_batch |> device
-        pred          = model(plaquette_matrices(U_d), U_d)
+        W0            = @timeit GLARE_TIMER "eval_plaquette_matrices" plaquette_matrices(U_d)
+        pred          = @timeit GLARE_TIMER "eval_forward" model(W0, U_d)
         pred_cpu      = Flux.cpu(pred)
         total_loss   += Float64(mse_loss(pred_cpu, corr))
         n_batches    += 1
@@ -261,6 +308,7 @@ function evaluate(model, ids; batch_size=BATCH_SIZE)
 
     r_per_t = pearson_r(all_pred, all_true)
     return total_loss / n_batches, r_per_t, all_pred, all_true
+    end # timeit evaluate
 end
 
 # Quick pre-training baseline
@@ -313,6 +361,7 @@ best_val_loss = Inf
 r_midt        = NaN
 
 for epoch in 1:EPOCHS
+    @timeit GLARE_TIMER "epoch" begin
     perm       = randperm(length(train_ids))
     epoch_loss = 0.0
     n_batches  = 0
@@ -330,12 +379,18 @@ for epoch in 1:EPOCHS
             idx > length(train_ids) && break
 
             batch_ids     = train_ids[perm[idx:min(idx + BATCH_SIZE - 1, length(train_ids))]]
-            U_batch, corr = load_batch(batch_ids; crop_s=TRAIN_CROP_S)
+            U_batch, corr = @timeit GLARE_TIMER "load_batch" load_batch(batch_ids; crop_s=TRAIN_CROP_S)
             U_batch       = U_batch |> device
             corr          = corr    |> device
 
-            loss_val, grads = Flux.withgradient(model) do m
-                mse_loss(m(plaquette_matrices(U_batch), U_batch), corr)
+            # Compute plaquette matrices outside withgradient:
+            # 1) they are input features, not model parameters — no grad needed
+            # 2) avoids Zygote taping through plaquette computation (saves memory + time)
+            # 3) allows separate timing with @timeit
+            W0 = @timeit GLARE_TIMER "plaquette_matrices" plaquette_matrices(U_batch)
+
+            loss_val, grads = @timeit GLARE_TIMER "forward+backward" Flux.withgradient(model) do m
+                mse_loss(m(W0, U_batch), corr)
             end
 
             accum_loss  += Float64(loss_val)
@@ -344,7 +399,7 @@ for epoch in 1:EPOCHS
         end
 
         if actual_steps > 0
-            Flux.update!(opt_state, model, _scale_grads(accum_grad, 1.0f0 / actual_steps))
+            @timeit GLARE_TIMER "optimizer_step" Flux.update!(opt_state, model, _scale_grads(accum_grad, 1.0f0 / actual_steps))
             epoch_loss += accum_loss / actual_steps
             n_batches  += 1
         end
@@ -373,6 +428,7 @@ for epoch in 1:EPOCHS
         @printf(io, "%d,%.6f,%.6f,%.6f,%.6f\n",
                 epoch, train_loss, val_loss, r_mean, r_midt)
     end
+    end # timeit epoch
 end
 
 # Save the final model regardless of whether it is the best.
@@ -478,3 +534,9 @@ savefig(joinpath(LOG_DIR, "lcnn_scatter_midt.pdf"))
 close(fig)
 
 println("\nLogs and plots written to: $LOG_DIR")
+
+# ---------------------------------------------------------------------------
+# Timer summary — full training breakdown
+# ---------------------------------------------------------------------------
+println("\n--- TimerOutputs summary ---")
+print_timer(GLARE_TIMER; sortby=:time)

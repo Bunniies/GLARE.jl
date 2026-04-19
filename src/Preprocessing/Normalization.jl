@@ -86,6 +86,7 @@ match the training target, so that the normalized targets have unit variance.
 function compute_normalization(gauge_h5::String, corr_h5::String,
                                 train_ids::Vector{String};
                                 polarizations::Vector{String} = ["g1-g1", "g2-g2", "g3-g3"])
+    @timeit GLARE_TIMER "compute_normalization" begin
 
     isempty(train_ids)     && error("train_ids is empty")
     isempty(polarizations) && error("polarizations must be non-empty")
@@ -144,6 +145,7 @@ function compute_normalization(gauge_h5::String, corr_h5::String,
     corr_std[corr_std .< 1e-12] .= 1.0
 
     return NormStats(feat_mean, feat_std, corr_mean, corr_std)
+    end # timeit
 end
 
 """
@@ -164,7 +166,7 @@ the training target. **Never uses val/test/bc data.**
 function compute_corr_normalization(corr_h5::String,
                                      train_ids::Vector{String};
                                      polarizations::Vector{String} = ["g1-g1", "g2-g2", "g3-g3"])
-
+    @timeit GLARE_TIMER "compute_corr_normalization" begin
     isempty(train_ids)     && error("train_ids is empty")
     isempty(polarizations) && error("polarizations must be non-empty")
 
@@ -196,6 +198,7 @@ function compute_corr_normalization(corr_h5::String,
     corr_std[corr_std .< 1e-12] .= 1.0
 
     return NormStats(Float64[], Float64[], corr_mean, corr_std)
+    end # timeit
 end
 
 """

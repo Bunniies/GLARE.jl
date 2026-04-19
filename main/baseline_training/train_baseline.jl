@@ -1,33 +1,38 @@
 using GLARE
 using Flux
 using HDF5
+using JLD2
 using Statistics
 using Printf
 using Random
+using LinearAlgebra
 using PyPlot
 
 # ---------------------------------------------------------------------------
 # Device selection — GPU if available, CPU otherwise.
-# Requires CUDA.jl (or Metal.jl on Apple Silicon) to be installed separately.
+# Requires CUDA.jl to be installed separately.
 # ---------------------------------------------------------------------------
 const device = Flux.gpu_device()
 
 # ---------------------------------------------------------------------------
 # Configuration — edit these paths and hyperparameters
 # ---------------------------------------------------------------------------
-ENV["GLARE_TEST_GAUGE_H5"] = "/Users/alessandroconigli/Lattice/data/HVP/LMA/hdf5/A654_all_t_sources/A654_gauge_scalar_1_680.h5"
-ENV["GLARE_TEST_CORR_H5"]  = "/Users/alessandroconigli/Lattice/data/HVP/LMA/hdf5/A654_all_t_sources/A654_corr.h5"
-
-gauge_h5 = get(ENV, "GLARE_TEST_GAUGE_H5", "")
-corr_h5  = get(ENV, "GLARE_TEST_CORR_H5", "")
+gauge_h5 = get(ENV, "GLARE_GAUGE_H5",
+    "/Users/alessandroconigli/Lattice/data/HVP/LMA/hdf5/A654_all_t_sources/A654_gauge_scalar.h5")
+corr_h5  = get(ENV, "GLARE_CORR_H5",
+    "/Users/alessandroconigli/Lattice/data/HVP/LMA/hdf5/A654_all_t_sources/A654_corr.h5")
 
 isfile(gauge_h5) || error("Gauge HDF5 not found: $gauge_h5")
 isfile(corr_h5)  || error("Correlator HDF5 not found: $corr_h5")
 
-# Output directory for logs and plots
-LOG_DIR  = get(ENV, "GLARE_LOG_DIR",
-               "/Users/alessandroconigli/Lattice/data/HVP/LMA/hdf5/A654_all_t_sources/training/")
+# Output directory for logs, plots, and checkpoints
+LOG_DIR = get(ENV, "GLARE_LOG_DIR",
+    "/Users/alessandroconigli/Lattice/data/HVP/LMA/hdf5/A654_all_t_sources/training_baseline/")
 mkpath(LOG_DIR)
+
+CHECKPOINT_PATH = joinpath(LOG_DIR, "baseline_best.jld2")    # best val-loss checkpoint
+FINAL_PATH      = joinpath(LOG_DIR, "baseline_final.jld2")   # model at last epoch
+CONFIG_PATH     = joinpath(LOG_DIR, "baseline_config.toml")  # human-readable run config
 
 # Lattice dimensions — read from HDF5 metadata to stay in sync with the database
 Lt, Ls, npls = HDF5.h5open(gauge_h5, "r") do fid
@@ -40,11 +45,12 @@ npol = 3
 POLARIZATIONS = ["g1-g1", "g2-g2", "g3-g3"]
 
 # Hyperparameters
-CHANNELS   = [16, 16]
-MLP_HIDDEN = 128
-LR         = 1e-3
-EPOCHS     = 30
-BATCH_SIZE = 32
+CHANNELS     = [16, 16]
+MLP_HIDDEN   = 128
+LR           = 1e-3
+WEIGHT_DECAY = 1e-4
+EPOCHS       = 30
+BATCH_SIZE   = 32
 
 # Set true to preload all splits into RAM before training (eliminates
 # per-batch HDF5 reads). Set false to keep the per-batch HDF5 path,
@@ -134,9 +140,63 @@ model = build_baseline_cnn(;
     mlp_hidden = MLP_HIDDEN) |> device
 
 # opt_state must be set up AFTER the model is on the target device.
-opt_state = Flux.setup(Adam(LR), model)
+opt_state = Flux.setup(Adam(LR, (0.9, 0.999), WEIGHT_DECAY), model)
 
-# --- Gradient sanity check ---
+n_params = sum(length, Flux.trainable(model))
+@printf("Baseline CNN: npls=%d  channels=%s  mlp_hidden=%d\n",
+        npls, string(CHANNELS), MLP_HIDDEN)
+@printf("Parameters: %d\n", n_params)
+
+# ---------------------------------------------------------------------------
+# Write run config to TOML for reproducibility and post-hoc checks
+# ---------------------------------------------------------------------------
+open(CONFIG_PATH, "w") do io
+    println(io, "# Baseline CNN training run configuration")
+    println(io, "# Generated automatically — do not edit by hand\n")
+
+    println(io, "[lattice]")
+    @printf(io, "Lt   = %d\n", Lt)
+    @printf(io, "Ls   = %d\n", Ls)
+    @printf(io, "npls = %d    # plaquette planes\n", npls)
+    println(io)
+
+    println(io, "[data]")
+    @printf(io, "gauge_h5      = \"%s\"\n", gauge_h5)
+    @printf(io, "corr_h5       = \"%s\"\n", corr_h5)
+    @printf(io, "polarizations = %s\n", string(POLARIZATIONS))
+    @printf(io, "n_train       = %d\n", length(train_ids))
+    @printf(io, "n_val         = %d\n", length(val_ids))
+    @printf(io, "n_test        = %d\n", length(test_ids))
+    @printf(io, "n_bc          = %d\n", length(bc_ids))
+    @printf(io, "preload       = %s\n", string(USE_PRELOAD))
+    println(io)
+
+    println(io, "[model]")
+    @printf(io, "channels   = %s\n", string(CHANNELS))
+    @printf(io, "mlp_hidden = %d\n", MLP_HIDDEN)
+    @printf(io, "n_params   = %d\n", n_params)
+    println(io)
+
+    println(io, "[training]")
+    @printf(io, "epochs       = %d\n", EPOCHS)
+    @printf(io, "batch_size   = %d\n", BATCH_SIZE)
+    @printf(io, "lr           = %.2e\n", LR)
+    @printf(io, "weight_decay = %.2e\n", WEIGHT_DECAY)
+    @printf(io, "optimizer    = \"Adam\"\n")
+    @printf(io, "device       = \"%s\"\n", string(device))
+    println(io)
+
+    println(io, "[output]")
+    @printf(io, "log_dir          = \"%s\"\n", LOG_DIR)
+    @printf(io, "checkpoint_best  = \"%s\"\n", CHECKPOINT_PATH)
+    @printf(io, "checkpoint_final = \"%s\"\n", FINAL_PATH)
+    @printf(io, "training_log     = \"%s\"\n", joinpath(LOG_DIR, "baseline_training_log.csv"))
+end
+println("Run config written to: $CONFIG_PATH")
+
+# ---------------------------------------------------------------------------
+# Gradient sanity check
+# ---------------------------------------------------------------------------
 let
     _feats, _corrs = get_batch(train_ids[1:2], train_cache)
     _feats = _feats |> device
@@ -145,34 +205,17 @@ let
         mean((m(_feats) .- _corrs).^2)
     end
     g = _grads[1]
-    using LinearAlgebra
     @printf("Gradient norms — conv1.weight: %.2e  conv2.weight: %.2e  dense1.weight: %.2e\n",
             norm(g.layers[1].conv.weight),
             norm(g.layers[2].conv.weight),
             norm(g.layers[5].weight))
 end
 
-##
-
 # ---------------------------------------------------------------------------
-# Loss
+# Loss and evaluation
 # ---------------------------------------------------------------------------
 
 mse_loss(ŷ, y) = mean((ŷ .- y) .^ 2)
-
-function batch_loss(model, feats, corrs)
-    ŷ = model(feats)
-    return mse_loss(ŷ, corrs)
-end
-
-# Does the batched loss correlate with r? Quick sanity check:
-_feats_big, _corrs_big = get_batch(train_ids[1:32], train_cache)
-@printf("32-sample batch loss: %.5f\n",
-        batch_loss(model, _feats_big |> device, _corrs_big |> device))
-
-# ---------------------------------------------------------------------------
-# Evaluation helper
-# ---------------------------------------------------------------------------
 
 function evaluate(model, ids, cache=nothing; batch_size=BATCH_SIZE)
     total_loss = 0.0
@@ -200,16 +243,19 @@ end
 # ---------------------------------------------------------------------------
 
 println("\n--- Training Phase-1 Baseline CNN ---")
-println("Epochs: $EPOCHS  |  Batch: $BATCH_SIZE  |  LR: $LR")
-println("Channels: $CHANNELS  |  MLP hidden: $MLP_HIDDEN\n")
+@printf("Epochs: %d  |  Batch: %d  |  LR: %.0e\n", EPOCHS, BATCH_SIZE, LR)
+@printf("Channels: %s  |  MLP hidden: %d  |  Device: %s\n\n",
+        string(CHANNELS), MLP_HIDDEN, string(device))
 
-log_path = joinpath(LOG_DIR, "training_log.csv")
+log_path = joinpath(LOG_DIR, "baseline_training_log.csv")
 open(log_path, "w") do io
     println(io, "epoch,train_loss,val_loss,r_mean,r_midt")
 end
 
-train_losses = Float64[]
-val_losses   = Float64[]
+train_losses  = Float64[]
+val_losses    = Float64[]
+best_val_loss = Inf
+r_midt        = NaN
 
 for epoch in 1:EPOCHS
     perm = randperm(length(train_ids))
@@ -223,7 +269,7 @@ for epoch in 1:EPOCHS
         corrs        = corrs  |> device
 
         loss_val, grads = Flux.withgradient(model) do m
-            batch_loss(m, feats, corrs)
+            mse_loss(m(feats), corrs)
         end
 
         Flux.update!(opt_state, model, grads[1])
@@ -239,8 +285,16 @@ for epoch in 1:EPOCHS
     push!(train_losses, train_loss)
     push!(val_losses,   val_loss)
 
-    @printf("Epoch %3d/%d  train_loss=%.5f  val_loss=%.5f  r̄=%.3f  r̄(mid-t)=%.3f\n",
-            epoch, EPOCHS, train_loss, val_loss, r_mean, r_midt)
+    improved = val_loss < best_val_loss
+    if improved
+        best_val_loss = val_loss
+        jldsave(CHECKPOINT_PATH; model=Flux.cpu(model), epoch=epoch,
+                val_loss=val_loss, r_midt=r_midt)
+    end
+
+    @printf("Epoch %3d/%d  train=%.5f  val=%.5f  r̄=%.3f  r̄(mid-t)=%.3f%s\n",
+            epoch, EPOCHS, train_loss, val_loss, r_mean, r_midt,
+            improved ? "  ✓ saved" : "")
 
     open(log_path, "a") do io
         @printf(io, "%d,%.6f,%.6f,%.6f,%.6f\n",
@@ -248,11 +302,13 @@ for epoch in 1:EPOCHS
     end
 end
 
+# Save the final model regardless of whether it is the best.
+jldsave(FINAL_PATH; model=Flux.cpu(model), epoch=EPOCHS,
+        val_loss=val_losses[end], r_midt=r_midt)
+
 # ---------------------------------------------------------------------------
 # Loss curve plot
 # ---------------------------------------------------------------------------
-##
-
 
 fig, ax = subplots(figsize=(7, 4))
 ax.plot(1:EPOCHS, train_losses, label="train")
@@ -262,14 +318,12 @@ ax.set_ylabel("MSE loss (normalised)")
 ax.set_title("Baseline CNN — loss curve")
 ax.legend()
 fig.tight_layout()
-savefig(joinpath(LOG_DIR, "loss_curve.pdf"))
+savefig(joinpath(LOG_DIR, "baseline_loss_curve.pdf"))
 close(fig)
 
 # ---------------------------------------------------------------------------
 # Final evaluation on test set
 # ---------------------------------------------------------------------------
-
-##
 
 println("\n--- Test set evaluation ---")
 test_loss, r_per_t, test_pred, test_true = evaluate(model, test_ids, test_cache)
@@ -282,7 +336,6 @@ println("\nr(t) per time slice:")
 for t in 1:Lt
     @printf("  t=%2d  r=%.3f\n", t, r_per_t[t])
 end
-##
 
 # ---------------------------------------------------------------------------
 # r(t) plot
@@ -296,7 +349,7 @@ ax.set_ylabel("Pearson r(t)")
 ax.set_title("Baseline CNN — Pearson r per time slice (test set)")
 ax.set_xlim(1, Lt)
 fig.tight_layout()
-savefig(joinpath(LOG_DIR, "pearson_r.pdf"))
+savefig(joinpath(LOG_DIR, "baseline_pearson_r.pdf"))
 close(fig)
 
 # ---------------------------------------------------------------------------
@@ -326,11 +379,13 @@ end
 axes[1].set_ylabel("C(t)")
 fig.suptitle("Baseline CNN — predicted vs exact correlator (test set, config average)")
 fig.tight_layout()
-savefig(joinpath(LOG_DIR, "correlator_comparison.pdf"))
+savefig(joinpath(LOG_DIR, "baseline_correlator_comparison.pdf"))
 close(fig)
 
-##
-# Per-config scatter at mid-t (one point per config, one panel per polarization)
+# ---------------------------------------------------------------------------
+# Per-config scatter at mid-t
+# ---------------------------------------------------------------------------
+
 t_mid = div(Lt, 2)
 fig, axes = subplots(1, npol; figsize=(5*npol, 4))
 for (ipol, pol) in enumerate(POLARIZATIONS)
@@ -346,7 +401,7 @@ for (ipol, pol) in enumerate(POLARIZATIONS)
 end
 fig.suptitle("Baseline CNN — scatter at t=$t_mid (test set)")
 fig.tight_layout()
-savefig(joinpath(LOG_DIR, "scatter_midt.pdf"))
+savefig(joinpath(LOG_DIR, "baseline_scatter_midt.pdf"))
 close(fig)
 
 println("\nLogs and plots written to: $LOG_DIR")

@@ -555,3 +555,36 @@ function build_lcnn(;
 
     return LCNN(blocks, pool, mlp, Lt, npol)
 end
+
+# ---------------------------------------------------------------------------
+# Forward-only profiling (no AD — safe to use @timeit inside layers)
+# ---------------------------------------------------------------------------
+
+"""
+    profile_forward(model::LCNN, U_batch; timer=GLARE_TIMER)
+
+Run one forward pass with per-layer TimerOutputs instrumentation.
+**Must be called outside `withgradient`** — `@timeit` mutates the timer
+dictionary, which is incompatible with Zygote.
+
+Use this before training to identify the computational bottleneck in the
+forward pass. The timer accumulates across calls; use `reset_timer!(timer)`
+to clear between runs.
+"""
+function profile_forward(model::LCNN, U_batch::AbstractArray{<:Complex, 8};
+                          timer::TimerOutput=GLARE_TIMER)
+    W = @timeit timer "plaquette_matrices" plaquette_matrices(U_batch)
+
+    for (k, blk) in enumerate(model.blocks)
+        W = @timeit timer "LCBBlock[$k]" begin
+            W_conv = @timeit timer "  GaugeEquivConv[$k]" blk.conv(W, U_batch)
+            W_out  = @timeit timer "  BilinearLayer[$k]" blk.bilin(W, W_conv)
+            @timeit timer "  ScalarGate[$k]" blk.gate(W_out)
+        end
+    end
+
+    x = @timeit timer "TracePool" model.pool(W)
+    x = reshape(x, model.Lt * size(x, 2), :)
+    x = @timeit timer "MLP" model.mlp(x)
+    return reshape(x, model.Lt, model.npol, :)
+end

@@ -44,7 +44,9 @@ Computes `P_μν(x) = U_μ(x)·U_ν(x+μ̂)·U†_μ(x+ν̂)·U†_ν(x)` for al
 **Planes enumerated explicitly** (`_plane(4,1)..._plane(2,1)`) — no `push!`, AD-safe under Zygote.
 Ordering `(4,1),(4,2),(4,3),(3,1),(3,2),(2,1)` matches `plaquette_field` (LatticeGPU convention: 1=x,2=y,3=z,4=t).
 Direction→array-dim map: `(4,5,6,3)[mu]` (dim 3=t, dim 4=x, dim 5=y, dim 6=z). **NOT `mu+2`.**
-Call site: `model(plaquette_matrices(U_batch), U_batch)` — plaquettes as W₀, links as U.
+Call site in `lcnn_training.jl`: `W0 = plaquette_matrices(U_batch)` **outside** `withgradient`,
+then `model(W0, U_batch)`. W₀ is a fixed input, so no gradient through plaquette computation
+is needed — avoids Zygote tape and allows `@timeit` measurement.
 
 **`ScalarGate()`** — `σ(Re(Tr Φ)) ⊙ Φ` (sigmoid gate). No params. Gauge-covariant. Shape preserved. **Must use sigmoid, not relu** — relu causes forward-value explosion across stacked blocks since Re(Tr) is unbounded for non-SU(3) matrices.
 Registered with `Functors.@functor` (NOT `Flux.@layer`) — `Flux.@layer` generates an `adapt_structure` that recurses infinitely on empty structs (no fields → Functors treats the struct itself as a leaf and re-enters). `Functors.@functor` sets `children = (;)` and reconstructs correctly.
@@ -82,6 +84,15 @@ conv runs 3x total (1x forward, 1x block rerun, 1x inner rerun during block reru
 **`build_lcnn(; Lt=48, C_in=6, ndim=4, channels=[4,4], npol=3, mlp_hidden=64)`** → `LCNN`
 `n` L-CB blocks → `TracePool` → MLP → `(Lt,npol,B)`. Same output signature as `build_baseline_cnn`.
 MLP weights initialized in Float64 (change to Float32 for GPU training).
+
+**`profile_forward(model::LCNN, U_batch; timer=GLARE_TIMER)`**
+AD-free forward pass with per-layer `@timeit` instrumentation. **Must be called outside
+`withgradient`** — `@timeit` mutates the timer dict, which breaks Zygote. Records timings
+for `plaquette_matrices`, `GaugeEquivConv[k]`, `BilinearLayer[k]`, `ScalarGate[k]`,
+`TracePool`, and `MLP` into `GLARE_TIMER`. Call `reset_timer!(GLARE_TIMER)` before/after
+to isolate profile measurements from training stats.
+**Do not add `@timeit` to layer `(l::Layer)(...)` methods** — those run inside AD; use
+`profile_forward` for the layer-level breakdown instead.
 
 ## Tensor layout convention
 

@@ -12,6 +12,7 @@ Layout: `(6, iL[4], iL[1], iL[2], iL[3], ndim)` — temporal coordinate first
 Call `su3_reconstruct` on the result to obtain full 3×3 matrices.
 """
 function load_links(links_h5::String, cid::String)
+    @timeit GLARE_TIMER "load_links" begin
     h5open(links_h5, "r") do fid
         haskey(fid["configs"], cid) ||
             error("Config \"$(cid)\" not found in $(links_h5)")
@@ -21,6 +22,7 @@ function load_links(links_h5::String, cid::String)
                   "Make sure you are passing the gauge link database.")
         read(grp["gauge_links"])   # ComplexF32[6, iL4, iL1, iL2, iL3, ndim] = [6, Lt, Ls, Ls, Ls, ndim]
     end
+    end # timeit
 end
 
 """
@@ -39,7 +41,7 @@ plane. `plaq_matrix` is never normalized (complex SU3 matrices).
 function load_gauge(gauge_h5::String, cid::String;
                     stats::Union{NormStats, Nothing} = nothing,
                     field::Symbol = :scalar)
-
+    @timeit GLARE_TIMER "load_gauge" begin
     field in (:scalar, :matrix) ||
         error("field must be :scalar or :matrix")
 
@@ -56,6 +58,7 @@ function load_gauge(gauge_h5::String, cid::String;
 
     stats === nothing && return features
     return _normalize_features(features, stats, field)
+    end # timeit
 end
 
 """
@@ -67,7 +70,7 @@ polarization. Applies z-score normalization per time slice if `stats` is provide
 function load_corr(corr_h5::String, cid::String;
                    stats::Union{NormStats, Nothing} = nothing,
                    polarization::String = "g1-g1")
-
+    @timeit GLARE_TIMER "load_corr" begin
     correlator = h5open(corr_h5, "r") do fid
         haskey(fid["configs"], cid) ||
             error("Config \"$(cid)\" not found in $(corr_h5)")
@@ -80,6 +83,7 @@ function load_corr(corr_h5::String, cid::String;
 
     stats === nothing && return correlator
     return _normalize_correlator(correlator, stats)
+    end # timeit
 end
 
 """
@@ -161,7 +165,7 @@ keep this within a typical 32–64 GB RAM budget.
 function preload_dataset(gauge_h5::String, corr_h5::String, ids::Vector{String},
                          stats::NormStats;
                          polarizations::Vector{String} = ["g1-g1", "g2-g2", "g3-g3"])
-
+    @timeit GLARE_TIMER "preload_dataset" begin
     isempty(ids) && return PreloadedDataset(
         Dict{String, Tuple{Array{Float32,5}, Matrix{Float32}}}())
 
@@ -195,4 +199,5 @@ function preload_dataset(gauge_h5::String, corr_h5::String, ids::Vector{String},
     end
 
     return PreloadedDataset(data)
+    end # timeit
 end

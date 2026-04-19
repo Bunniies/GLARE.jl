@@ -58,12 +58,13 @@ z-score normalization, `merge_dataset` for server shards.
 - [x] **Rebuild `*_gauge_links.h5`** — done (2026-04-15). Old files used `VOL=(48,24,24,24)` (wrong coordinate packing); new database uses correct `VOL=(24,24,24,48)` convention.
 - [ ] **Rebuild `*_gauge_scalar.h5`** — still pending. Same VOL bug applies; scalar DB not yet corrected.
 
-### Phase 1 — Baseline CNN ✓ (needs rerun)
+### Phase 1 — Baseline CNN ✓ (needs rerun on correct data)
 `PeriodicConv4D`, `build_baseline_cnn`, `train_baseline.jl`.
 Scalar plaquette ceiling r~0.1 expected even with correct data — coordinate scrambling from
 the VOL bug made previous r(t) estimates unreliable. Rebuild scalar DB, then retrain.
-- [ ] Rebuild `*_gauge_scalar.h5` (see Phase 0 note above)
-- [ ] Run full training on correct data, evaluate r(t) on test set
+Training script updated for GPU (`|> device` pattern, JLD2 checkpointing, TOML config logging).
+- [ ] Rebuild `*_gauge_scalar.h5` (see Phase 0 note above) — in progress (2026-04-16)
+- [ ] Run full GPU training on correct data, evaluate r(t) on test set
 
 ### Phase 2 — Gauge-equivariant L-CNN ✓ (architecture complete, training in progress)
 `su3_reconstruct`, `plaquette_matrices`, `ScalarGate`, `TracePool`, `BilinearLayer`,
@@ -74,6 +75,10 @@ site-dependent V(x). W₀ = plaquette matrices (C_in=6); raw links are NOT valid
 - [x] GPU support — `BilinearLayer{A}` and `GaugeEquivConv{A}` parametrised so `Flux.gpu(model)`
   works correctly; `|> device` pattern in both training scripts; `opt_state` set up after
   `model |> device`; `Flux.cpu(pred)` in `evaluate`; `Float64(loss_val)` for GPU scalar accumulation.
+  **CUDA module loading**: CUDA.jl ships its own runtime — `module load system/CUDA` on the
+  cluster can override `libcublasLt.so` and break large matmuls (small ones work, large ones
+  get `CUBLAS_STATUS_NOT_INITIALIZED`). Fix: use a compatible module version or strip CUDA
+  paths from `LD_LIBRARY_PATH` before launching Julia.
 
 ### Phase 3 — Training and evaluation
 - [x] `lcnn_training.jl` training script (spatial crop for CPU, plaquette W₀)
@@ -84,6 +89,15 @@ site-dependent V(x). W₀ = plaquette matrices (C_in=6); raw links are NOT valid
 - [x] Gradient accumulation: `ACCUM_STEPS` mini-batches accumulated before one optimizer step.
   Effective batch = `BATCH_SIZE × ACCUM_STEPS`. Keeps peak GPU memory at one config while
   simulating larger batches. Uses `_add_grads`/`_scale_grads` helpers in `lcnn_training.jl`.
+- [x] In-memory data preloading: `LINKS_CACHE` (`Dict{String, Array{ComplexF32,7}}`) and
+  `CORR_CACHE` (`Dict{String, Matrix{Float32}}`) populated at startup from HDF5 (opened once).
+  `su3_reconstruct` called once per config at preload time. Training loop is then pure
+  compute — zero HDF5 I/O per step. Requires ~191 MB/config CPU RAM (feasible at 1.6 TB).
+- [x] TimerOutputs profiling: `GLARE_TIMER` (global `TimerOutput`) exported from `GLARE.jl`.
+  Source-level `@timeit` on data loading / normalization functions. Training script times
+  preloading, `plaquette_matrices`, forward+backward, optimizer step, and evaluation.
+  `profile_forward(model, U)` runs one AD-free forward pass with per-layer breakdown.
+  Full timer printed at end of training run.
 - [ ] LR schedule (cosine annealing or ReduceLROnPlateau)
 - [ ] r²(t) as primary metric; bias correction at inference
 - [ ] Alternative losses: time-weighted MSE or `L = Σ_t (1 - r(t)²)`
@@ -114,9 +128,14 @@ site-dependent V(x). W₀ = plaquette matrices (C_in=6); raw links are NOT valid
   (different sites on left/right) — NOT gauge-covariant. Use `plaquette_matrices(U_batch)`
   to get `P_μν(x) → V(x) P V†(x)` (C_in=6). Passing links as W₀ silently breaks all
   downstream equivariance and prevents the model from learning.
-- **`plaquette_matrices` must not use `push!`.** Called inside `withgradient`, so Zygote
-  differentiates through it. Use explicit `cat(_plane(4,1), ..., _plane(2,1); dims=7)` —
-  no mutation, AD-safe. A `push!(planes, ...)` loop triggers "Mutating arrays not supported".
+- **`plaquette_matrices` must not use `push!`.** It can be called inside `withgradient`
+  (e.g. user code), so the implementation must remain AD-safe. Use explicit
+  `cat(_plane(4,1), ..., _plane(2,1); dims=7)` — no mutation. A `push!(planes, ...)` loop
+  triggers "Mutating arrays not supported" under Zygote.
+  In `lcnn_training.jl` it is deliberately computed **outside** `withgradient` as
+  `W0 = plaquette_matrices(U_batch)` — W₀ is a fixed input feature, not a model parameter,
+  so no gradient through the plaquette computation is needed. This avoids Zygote taping
+  through it, saves tape memory, and allows separate `@timeit` measurement.
 - **GaugeEquivConv uses `Zygote.Buffer` for transport stacking.** All `_pt_fwd`/`_pt_bwd`
   results are written to a pre-sized `Buffer(W, 3, 3, n_ch, N)`, then `copy(buf)` gives
   `PT_all`. This is O(C_in×ndim×N) memory — linear. Do NOT use sequential `cat` in a

@@ -1,5 +1,9 @@
 module GLARE
 
+using TimerOutputs
+const GLARE_TIMER = TimerOutput()
+export GLARE_TIMER
+
 include("IO.jl")
 using .IO
 export import_cern64, set_reader
@@ -27,6 +31,6 @@ include("Model/Model.jl")
 using .Model
 export PeriodicConv4D, build_baseline_cnn, pearson_r   # Phase 1
 export su3_reconstruct, BilinearLayer, ScalarGate, TracePool, GaugeEquivConv, LCBBlock, plaquette_matrices  # Phase 2
-export LCNN, build_lcnn  # Phase 2 — full model
+export LCNN, build_lcnn, profile_forward  # Phase 2 — full model
 
 end # module GLARE
