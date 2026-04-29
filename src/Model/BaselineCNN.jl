@@ -109,7 +109,8 @@ function build_baseline_cnn(;
         npls       :: Int         = 6,
         npol       :: Int         = 3,
         channels   :: Vector{Int} = [16, 16],
-        mlp_hidden :: Int         = 128)
+        mlp_hidden :: Int         = 128,
+        dropout    :: Float64     = 0.3)
 
     layers = Any[]
     in_ch = npls
@@ -128,6 +129,7 @@ function build_baseline_cnn(;
           x -> reshape(x, Lt * final_ch, :))                            # (Lt*ch, B)
 
     push!(layers, Dense(Lt * final_ch, mlp_hidden, relu))
+    push!(layers, Flux.Dropout(dropout))
     push!(layers, Dense(mlp_hidden, Lt * npol))
 
     push!(layers,

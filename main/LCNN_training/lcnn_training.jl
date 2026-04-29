@@ -57,9 +57,12 @@ WEIGHT_DECAY = 1e-4
 EPOCHS     = 200
 BATCH_SIZE = 1              # small: each config ~ 190 MB reconstructed links
                             # batch=4 ~ 760 MB field tensors before Zygote tape
-ACCUM_STEPS = 4             # gradient accumulation: effective batch = BATCH_SIZE * ACCUM_STEPS
+ACCUM_STEPS = 32            # gradient accumulation: effective batch = BATCH_SIZE * ACCUM_STEPS
                             # each forward/backward processes BATCH_SIZE configs; gradients
                             # are averaged over ACCUM_STEPS steps before one optimizer update.
+                            # With MSE loss, effective_batch=32 gives SNR~1.4 for r~0.1 signal.
+                            # r_loss is NOT used here: with BATCH_SIZE=1, r over 1 config is
+                            # undefined (always ±1). r_loss requires ≥16 configs per forward pass.
 
 # ---------------------------------------------------------------------------
 # Data split
@@ -354,10 +357,10 @@ println("\n--- Training L-CNN ---")
 
 log_path = joinpath(LOG_DIR, "lcnn_training_log.csv")
 open(log_path, "w") do io
-    println(io, "epoch,train_rloss,val_mse,r_mean,r_midt")
+    println(io, "epoch,train_mse,val_mse,r_mean,r_midt")
 end
 
-train_rlosses = Float64[]
+train_losses  = Float64[]
 val_losses    = Float64[]
 best_r_mean   = -Inf
 r_midt        = NaN
@@ -392,7 +395,7 @@ for epoch in 1:EPOCHS
             W0 = @timeit GLARE_TIMER "plaquette_matrices" plaquette_matrices(U_batch)
 
             loss_val, grads = @timeit GLARE_TIMER "forward+backward" Flux.withgradient(model) do m
-                r_loss(m(W0, U_batch), corr)
+                mse_loss(m(W0, U_batch), corr)
             end
 
             accum_loss  += Float64(loss_val)
@@ -407,13 +410,13 @@ for epoch in 1:EPOCHS
         end
     end
 
-    train_rloss            = epoch_loss / n_batches
+    train_loss             = epoch_loss / n_batches
     val_loss, r_per_t, _, _ = evaluate(model, val_ids)
     r_mean = mean(r_per_t)
     r_midt = mean(r_per_t[div(Lt, 4):3*div(Lt, 4)])
 
-    push!(train_rlosses, train_rloss)
-    push!(val_losses,    val_loss)
+    push!(train_losses, train_loss)
+    push!(val_losses,   val_loss)
 
     # Cosine annealing: LR decays from LR → 0 over EPOCHS
     new_lr = LR * (1 + cos(π * epoch / EPOCHS)) / 2
@@ -426,13 +429,13 @@ for epoch in 1:EPOCHS
                 val_mse=val_loss, r_midt=r_midt)
     end
 
-    @printf("Epoch %3d/%d  r_loss=%.4f  val_mse=%.4f  r̄=%.3f  r̄(mid-t)=%.3f%s\n",
-            epoch, EPOCHS, train_rloss, val_loss, r_mean, r_midt,
+    @printf("Epoch %3d/%d  train_mse=%.5f  val_mse=%.5f  r̄=%.3f  r̄(mid-t)=%.3f%s\n",
+            epoch, EPOCHS, train_loss, val_loss, r_mean, r_midt,
             improved ? "  ✓ saved" : "")
 
     open(log_path, "a") do io
         @printf(io, "%d,%.6f,%.6f,%.6f,%.6f\n",
-                epoch, train_rloss, val_loss, r_mean, r_midt)
+                epoch, train_loss, val_loss, r_mean, r_midt)
     end
     end # timeit epoch
 end
@@ -448,8 +451,8 @@ jldsave(FINAL_PATH; model=Flux.cpu(model), epoch=EPOCHS,
 ##
 
 fig, ax = subplots(figsize=(7, 4))
-ax.plot(1:EPOCHS, train_rlosses, label="train r-loss (-mean r)")
-ax.plot(1:EPOCHS, val_losses,   label="val MSE", linestyle="--")
+ax.plot(1:EPOCHS, train_losses, label="train MSE")
+ax.plot(1:EPOCHS, val_losses,  label="val MSE", linestyle="--")
 ax.set_xlabel("Epoch")
 ax.set_ylabel("Loss")
 ax.set_title("L-CNN — loss curve")

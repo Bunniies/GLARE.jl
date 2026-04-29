@@ -48,8 +48,9 @@ POLARIZATIONS = ["g1-g1", "g2-g2", "g3-g3"]
 # Hyperparameters
 CHANNELS     = [16, 16]
 MLP_HIDDEN   = 128
-LR           = 1e-3
-WEIGHT_DECAY = 1e-4
+DROPOUT      = 0.3    # dropout between Dense layers — prevents memorisation of training configs
+LR           = 3e-4   # reduced from 1e-3; overfitting was fast at 1e-3 with r_loss
+WEIGHT_DECAY = 1e-2   # increased from 1e-4; stronger L2 needed with r_loss + small batch
 EPOCHS       = 200
 BATCH_SIZE   = 32
 
@@ -138,7 +139,8 @@ model = build_baseline_cnn(;
     npls       = npls,
     npol       = npol,
     channels   = CHANNELS,
-    mlp_hidden = MLP_HIDDEN) |> device
+    mlp_hidden = MLP_HIDDEN,
+    dropout    = DROPOUT) |> device
 
 # opt_state must be set up AFTER the model is on the target device.
 opt_state = Flux.setup(Adam(LR, (0.9, 0.999), WEIGHT_DECAY), model)
@@ -221,6 +223,7 @@ mse_loss(ŷ, y) = mean((ŷ .- y) .^ 2)
 r_loss(ŷ, y)   = pearson_r_loss(ŷ, y)   # -mean r(t,pol) over batch
 
 function evaluate(model, ids, cache=nothing; batch_size=BATCH_SIZE)
+    Flux.testmode!(model)
     total_loss = 0.0
     n_batches  = 0
     all_pred   = Array{Float32}(undef, Lt, npol, 0)
@@ -237,6 +240,7 @@ function evaluate(model, ids, cache=nothing; batch_size=BATCH_SIZE)
         all_true = cat(all_true, corrs;    dims=3)
     end
 
+    Flux.trainmode!(model)
     r_per_t = pearson_r(all_pred, all_true)
     return total_loss / n_batches, r_per_t, all_pred, all_true
 end
