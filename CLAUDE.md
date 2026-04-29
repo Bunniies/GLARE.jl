@@ -56,14 +56,25 @@ Gauge scalar/link HDF5 builders, correlator builder, 4-way interleaved split,
 z-score normalization, `merge_dataset` for server shards.
 - [ ] Float32 storage in `build_gauge_dataset`
 - [x] **Rebuild `*_gauge_links.h5`** — done (2026-04-15). Old files used `VOL=(48,24,24,24)` (wrong coordinate packing); new database uses correct `VOL=(24,24,24,48)` convention.
-- [ ] **Rebuild `*_gauge_scalar.h5`** — still pending. Same VOL bug applies; scalar DB not yet corrected.
+- [x] **Rebuild `*_gauge_scalar.h5`** — done (2026-04-29). Same VOL bug fixed.
 
 ### Phase 1 — Baseline CNN ✓ (needs rerun on correct data)
 `PeriodicConv4D`, `build_baseline_cnn`, `train_baseline.jl`.
-Scalar plaquette ceiling r~0.1 expected even with correct data — coordinate scrambling from
-the VOL bug made previous r(t) estimates unreliable. Rebuild scalar DB, then retrain.
+Scalar plaquette ceiling r~0.1 expected even with correct data.
 Training script updated for GPU (`|> device` pattern, JLD2 checkpointing, TOML config logging).
-- [ ] Rebuild `*_gauge_scalar.h5` (see Phase 0 note above) — in progress (2026-04-16)
+Recommended hyperparameters: `CHANNELS=[16,16]`, `MLP_HIDDEN=128`, `BATCH_SIZE=32`,
+`LR=1e-3`, `WEIGHT_DECAY=1e-4`, `EPOCHS=200`.
+Cosine LR schedule added at end of epoch loop: `Flux.Optimisers.adjust!(opt_state, LR*(1+cos(π*epoch/EPOCHS))/2)`.
+Note: `adjust!` lives in `Flux.Optimisers` (new API) — not `Flux.Optimise`.
+**Loss: `pearson_r_loss` (not MSE).** MSE fails entirely for r~0.1 signal: the best possible
+MSE improvement is only 1% (1.000→0.990), which is below per-batch gradient noise. The model
+collapses to predicting the training mean (scatter plot: horizontal line at ŷ=0, r≈0.007 at
+mid-t) and never escapes. `pearson_r_loss` = `-mean_t mean_pol r(t,pol)` over batch B; its
+gradient is O(1/N) regardless of r, and diverges toward the target when var(ŷ)→0, breaking
+the symmetry of the mean predictor. Checkpoint on best `r_mean` (not val MSE).
+Parameter counting: use `ps, _ = Flux.destructure(model); n_params = length(ps)` — NOT
+`sum(length, Flux.trainable(model))` which returns the number of layers (7), not parameters.
+- [x] Rebuild `*_gauge_scalar.h5` — done (2026-04-29)
 - [ ] Run full GPU training on correct data, evaluate r(t) on test set
 
 ### Phase 2 — Gauge-equivariant L-CNN ✓ (architecture complete, training in progress)
@@ -98,7 +109,9 @@ site-dependent V(x). W₀ = plaquette matrices (C_in=6); raw links are NOT valid
   preloading, `plaquette_matrices`, forward+backward, optimizer step, and evaluation.
   `profile_forward(model, U)` runs one AD-free forward pass with per-layer breakdown.
   Full timer printed at end of training run.
-- [ ] LR schedule (cosine annealing or ReduceLROnPlateau)
+- [x] LR schedule: cosine annealing via `Flux.Optimisers.adjust!` in both training scripts.
+- [x] `pearson_r_loss` as training loss in both `train_baseline.jl` and `lcnn_training.jl`.
+  Checkpoint on best `r_mean`; `val_mse` still tracked as diagnostic.
 - [ ] r²(t) as primary metric; bias correction at inference
 - [ ] Alternative losses: time-weighted MSE or `L = Σ_t (1 - r(t)²)`
 
@@ -111,7 +124,14 @@ site-dependent V(x). W₀ = plaquette matrices (C_in=6); raw links are NOT valid
 
 - **`_circular_pad` / `_roll` must use `cat`-based slicing** — fancy integer-vector
   indexing silently returns zero gradients through conv layers under Zygote.
-- **Baseline CNN: use batch ≥ 32, LR ≤ 1e-3.** Signal is r~0.1 → only 0.25% MSE
+- **Use `pearson_r_loss`, not MSE, for training both the baseline and L-CNN.**
+  MSE loss fails for r~0.1 signal: best-case MSE improvement is 1% (1.000→0.990), below
+  per-batch gradient noise (~1/√(B·Lt·npol)). The model collapses to predicting the training
+  mean (ŷ≈0 in normalized space) and never escapes — confirmed experimentally (scatter at
+  t=24 showed a horizontal line, r=0.007). `pearson_r_loss` = `-mean r(t,pol)` over batch;
+  gradient is O(1/N) regardless of r, breaking the mean-predictor fixed point.
+  Both `train_baseline.jl` and `lcnn_training.jl` now use `r_loss`; checkpoint on `r_mean`.
+- **Baseline CNN: use batch ≥ 32, LR ≤ 1e-3.** Signal is r~0.1 → only 1% MSE
   improvement over mean prediction. Batch=8 buries the gradient SNR completely.
 - **Float32 training for L-CNN.** Links stored as ComplexF32; unitarity holds to ~1e-6
   after reconstruction. Float32 gives 2-4× GPU throughput via tensor cores.

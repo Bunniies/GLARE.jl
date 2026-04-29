@@ -32,6 +32,10 @@
   Update defaults or set ENV vars when running on the cluster.
 - **Normalization**: uses `compute_normalization` (both gauge feature stats and correlator stats).
 - **`Flux.trainable`** used instead of deprecated `Flux.params` for parameter counting.
+- **LR schedule**: cosine annealing via `Flux.Optimisers.adjust!` at the end of each epoch.
+  `new_lr = LR * (1 + cos(π * epoch / EPOCHS)) / 2`. Requires `EPOCHS ≥ 150` to be effective —
+  with 30 epochs the optimizer stalls after ~10 epochs; the decaying tail is where fine
+  convergence happens. Use `Flux.Optimisers.adjust!`, not `Flux.Optimise.adjust!` (old API).
 
 ## L-CNN training notes (`LCNN_training/lcnn_training.jl`)
 

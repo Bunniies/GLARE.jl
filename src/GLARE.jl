@@ -29,7 +29,7 @@ export split_configs, NormStats, compute_normalization, compute_corr_normalizati
 
 include("Model/Model.jl")
 using .Model
-export PeriodicConv4D, build_baseline_cnn, pearson_r   # Phase 1
+export PeriodicConv4D, build_baseline_cnn, pearson_r, pearson_r_loss   # Phase 1
 export su3_reconstruct, BilinearLayer, ScalarGate, TracePool, GaugeEquivConv, LCBBlock, plaquette_matrices  # Phase 2
 export LCNN, build_lcnn, profile_forward  # Phase 2 — full model
 

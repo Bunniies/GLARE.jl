@@ -166,3 +166,32 @@ function pearson_r(y_pred::AbstractArray{<:Real, 3},
     end
     return r
 end
+
+"""
+    pearson_r_loss(y_pred, y_true; ε=1f-6) -> scalar
+
+Differentiable training loss: `-mean_t mean_pol r(t, pol)`, computed over the
+batch dimension B.  Maximising Pearson r directly avoids the "predict the mean"
+failure mode of MSE when the true signal is small (r ~ 0.1 → only 1% of variance).
+
+The ε term in the denominator keeps the gradient finite when the model output is
+constant (var(ŷ) → 0): the gradient then points in the direction of `y_centered`,
+pulling ŷ immediately toward the target deviations.
+
+Arguments:
+- `y_pred`, `y_true`: `(Lt, npol, B)` arrays (normalised space, Float32)
+- `ε`: regulariser for the denominator (default 1f-6, relative to unit variance)
+"""
+function pearson_r_loss(y_pred::AbstractArray{T, 3},
+                        y_true::AbstractArray{T, 3};
+                        ε::T = T(1e-6)) where {T <: Real}
+    ŷ_c = y_pred .- mean(y_pred; dims=3)   # (Lt, npol, B) centred predictions
+    y_c = y_true .- mean(y_true; dims=3)   # (Lt, npol, B) centred targets
+
+    cov_ŷy = mean(ŷ_c .* y_c;   dims=3)   # (Lt, npol, 1)
+    var_ŷ  = mean(ŷ_c .^ 2;     dims=3)   # (Lt, npol, 1)
+    var_y  = mean(y_c .^ 2;     dims=3)   # (Lt, npol, 1)  — constant wrt ŷ
+
+    r = cov_ŷy ./ sqrt.(var_ŷ .* var_y .+ ε)   # (Lt, npol, 1)
+    return -mean(r)
+end

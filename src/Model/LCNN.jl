@@ -456,7 +456,8 @@ function (l::LCBBlock)(W::AbstractArray{<:Complex, 8},
     # checkpoint in LCNN, conv runs 3x total (1x forward + 1x block rerun + 1x inner
     # rerun during block rerun's backward). Without this, conv intermediates stay live
     # and can push peak memory over GPU limits.
-    W_conv = Zygote.checkpointed(l.conv, W, U)
+    W_conv = Zygote.checkpointed(l.conv, W, U) # with checkpointed
+    # W_conv = l.conv(W, U) # without checkpointed 
     W_out  = l.bilin(W, W_conv)
     return l.gate(W_out)
 end
@@ -504,7 +505,8 @@ Flux.@layer LCNN
 function (m::LCNN)(W::AbstractArray{<:Complex, 8},
                     U::AbstractArray{<:Complex, 8})
     for blk in m.blocks
-        W = Zygote.checkpointed(blk, W, U)
+        W = Zygote.checkpointed(blk, W, U) # with checkpointed
+        # W = blk(W, U)  # without outer checkpoint
     end
     x = m.pool(W)                                   # (Lt, C_last, B)  real
     x = reshape(x, m.Lt * size(x, 2), :)            # (Lt*C_last, B)

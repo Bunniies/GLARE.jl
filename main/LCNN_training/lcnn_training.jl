@@ -54,7 +54,7 @@ CHANNELS   = [2, 2]         # L-CB block output channels (conservative for memor
 MLP_HIDDEN = 64
 LR           = 3e-3
 WEIGHT_DECAY = 1e-4
-EPOCHS     = 10
+EPOCHS     = 200
 BATCH_SIZE = 1              # small: each config ~ 190 MB reconstructed links
                             # batch=4 ~ 760 MB field tensors before Zygote tape
 ACCUM_STEPS = 4             # gradient accumulation: effective batch = BATCH_SIZE * ACCUM_STEPS
@@ -177,10 +177,11 @@ model = build_lcnn(;
 # moments live on the same device as the parameters.
 # All parameters are already Float32/ComplexF32 from build_lcnn — no f32 cast needed.
 
-# model     = model |> device # it crashes locally with rosetta
+model     = model |> device
 opt_state = Flux.setup(Adam(LR, (0.9, 0.999), WEIGHT_DECAY), model)
 
-n_params = sum(length, Flux.params(model))
+ps, _    = Flux.destructure(model)
+n_params = length(ps)
 @printf("L-CNN: C_in=%d  channels=%s  mlp_hidden=%d  ndim=%d\n",
         C_IN, string(CHANNELS), MLP_HIDDEN, ndim)
 @printf("Parameters: %d\n", n_params)
@@ -285,6 +286,7 @@ println()
 # ---------------------------------------------------------------------------
 
 mse_loss(ŷ, y) = mean((ŷ .- y).^2)
+r_loss(ŷ, y)   = pearson_r_loss(ŷ, y)
 
 function evaluate(model, ids; batch_size=BATCH_SIZE)
     @timeit GLARE_TIMER "evaluate" begin
@@ -325,9 +327,9 @@ function _add_grads(g1, g2)
     g1 === nothing && return g2
     g2 === nothing && return g1
     g1 isa NamedTuple && return NamedTuple{keys(g1)}(map(k -> _add_grads(g1[k], g2[k]), keys(g1)))
+    g1 isa AbstractArray{<:Number} && return g1 .+ g2   # numeric arrays (CPU or GPU) — must precede AbstractVector
     g1 isa AbstractVector && return [_add_grads(g1[i], g2[i]) for i in eachindex(g1)]
     g1 isa Tuple && return ntuple(i -> _add_grads(g1[i], g2[i]), length(g1))
-    g1 isa AbstractArray && return g1 .+ g2
     return g1
 end
 
@@ -335,9 +337,9 @@ end
 function _scale_grads(g, s::Real)
     g === nothing && return nothing
     g isa NamedTuple && return NamedTuple{keys(g)}(map(k -> _scale_grads(g[k], s), keys(g)))
+    g isa AbstractArray{<:Number} && return g .* s      # numeric arrays (CPU or GPU) — must precede AbstractVector
     g isa AbstractVector && return [_scale_grads(g[i], s) for i in eachindex(g)]
     g isa Tuple && return ntuple(i -> _scale_grads(g[i], s), length(g))
-    g isa AbstractArray && return g .* s
     return g
 end
 
@@ -352,12 +354,12 @@ println("\n--- Training L-CNN ---")
 
 log_path = joinpath(LOG_DIR, "lcnn_training_log.csv")
 open(log_path, "w") do io
-    println(io, "epoch,train_loss,val_loss,r_mean,r_midt")
+    println(io, "epoch,train_rloss,val_mse,r_mean,r_midt")
 end
 
-train_losses  = Float64[]
+train_rlosses = Float64[]
 val_losses    = Float64[]
-best_val_loss = Inf
+best_r_mean   = -Inf
 r_midt        = NaN
 
 for epoch in 1:EPOCHS
@@ -390,7 +392,7 @@ for epoch in 1:EPOCHS
             W0 = @timeit GLARE_TIMER "plaquette_matrices" plaquette_matrices(U_batch)
 
             loss_val, grads = @timeit GLARE_TIMER "forward+backward" Flux.withgradient(model) do m
-                mse_loss(m(W0, U_batch), corr)
+                r_loss(m(W0, U_batch), corr)
             end
 
             accum_loss  += Float64(loss_val)
@@ -405,35 +407,39 @@ for epoch in 1:EPOCHS
         end
     end
 
-    train_loss         = epoch_loss / n_batches
+    train_rloss            = epoch_loss / n_batches
     val_loss, r_per_t, _, _ = evaluate(model, val_ids)
     r_mean = mean(r_per_t)
     r_midt = mean(r_per_t[div(Lt, 4):3*div(Lt, 4)])
 
-    push!(train_losses, train_loss)
-    push!(val_losses,   val_loss)
+    push!(train_rlosses, train_rloss)
+    push!(val_losses,    val_loss)
 
-    improved = val_loss < best_val_loss
+    # Cosine annealing: LR decays from LR → 0 over EPOCHS
+    new_lr = LR * (1 + cos(π * epoch / EPOCHS)) / 2
+    Flux.Optimisers.adjust!(opt_state, new_lr)
+
+    improved = r_mean > best_r_mean
     if improved
-        best_val_loss = val_loss
+        best_r_mean = r_mean
         jldsave(CHECKPOINT_PATH; model=Flux.cpu(model), epoch=epoch,
-                val_loss=val_loss, r_midt=r_midt)
+                val_mse=val_loss, r_midt=r_midt)
     end
 
-    @printf("Epoch %3d/%d  train=%.5f  val=%.5f  r̄=%.3f  r̄(mid-t)=%.3f%s\n",
-            epoch, EPOCHS, train_loss, val_loss, r_mean, r_midt,
+    @printf("Epoch %3d/%d  r_loss=%.4f  val_mse=%.4f  r̄=%.3f  r̄(mid-t)=%.3f%s\n",
+            epoch, EPOCHS, train_rloss, val_loss, r_mean, r_midt,
             improved ? "  ✓ saved" : "")
 
     open(log_path, "a") do io
         @printf(io, "%d,%.6f,%.6f,%.6f,%.6f\n",
-                epoch, train_loss, val_loss, r_mean, r_midt)
+                epoch, train_rloss, val_loss, r_mean, r_midt)
     end
     end # timeit epoch
 end
 
 # Save the final model regardless of whether it is the best.
 jldsave(FINAL_PATH; model=Flux.cpu(model), epoch=EPOCHS,
-        val_loss=val_losses[end], r_midt=r_midt)
+        val_mse=val_losses[end], r_midt=r_midt)
 
 # ---------------------------------------------------------------------------
 # Loss curve
@@ -442,10 +448,10 @@ jldsave(FINAL_PATH; model=Flux.cpu(model), epoch=EPOCHS,
 ##
 
 fig, ax = subplots(figsize=(7, 4))
-ax.plot(1:EPOCHS, train_losses, label="train")
-ax.plot(1:EPOCHS, val_losses,   label="val")
+ax.plot(1:EPOCHS, train_rlosses, label="train r-loss (-mean r)")
+ax.plot(1:EPOCHS, val_losses,   label="val MSE", linestyle="--")
 ax.set_xlabel("Epoch")
-ax.set_ylabel("MSE loss (normalised)")
+ax.set_ylabel("Loss")
 ax.set_title("L-CNN — loss curve")
 ax.legend()
 fig.tight_layout()

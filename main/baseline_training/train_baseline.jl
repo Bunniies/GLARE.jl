@@ -6,6 +6,7 @@ using Statistics
 using Printf
 using Random
 using LinearAlgebra
+# ENV["MPLBACKEND"] = "Agg"   # headless rendering — no display required
 using PyPlot
 
 # ---------------------------------------------------------------------------
@@ -49,13 +50,13 @@ CHANNELS     = [16, 16]
 MLP_HIDDEN   = 128
 LR           = 1e-3
 WEIGHT_DECAY = 1e-4
-EPOCHS       = 30
+EPOCHS       = 200
 BATCH_SIZE   = 32
 
-# Set true to preload all splits into RAM before training (eliminates
-# per-batch HDF5 reads). Set false to keep the per-batch HDF5 path,
-# which is useful when RAM is limited or for quick diagnostic runs.
-USE_PRELOAD = false
+# Set true (or set ENV GLARE_USE_PRELOAD=true) to preload all splits into RAM
+# before training (eliminates per-batch HDF5 reads). Set false for quick
+# diagnostic runs or when RAM is limited.
+USE_PRELOAD = true # parse(Bool, get(ENV, "GLARE_USE_PRELOAD", "false"))
 
 # ---------------------------------------------------------------------------
 # Data split and normalization
@@ -142,7 +143,8 @@ model = build_baseline_cnn(;
 # opt_state must be set up AFTER the model is on the target device.
 opt_state = Flux.setup(Adam(LR, (0.9, 0.999), WEIGHT_DECAY), model)
 
-n_params = sum(length, Flux.trainable(model))
+ps, _   = Flux.destructure(model)
+n_params = length(ps)
 @printf("Baseline CNN: npls=%d  channels=%s  mlp_hidden=%d\n",
         npls, string(CHANNELS), MLP_HIDDEN)
 @printf("Parameters: %d\n", n_params)
@@ -216,6 +218,7 @@ end
 # ---------------------------------------------------------------------------
 
 mse_loss(ŷ, y) = mean((ŷ .- y) .^ 2)
+r_loss(ŷ, y)   = pearson_r_loss(ŷ, y)   # -mean r(t,pol) over batch
 
 function evaluate(model, ids, cache=nothing; batch_size=BATCH_SIZE)
     total_loss = 0.0
@@ -249,18 +252,18 @@ println("\n--- Training Phase-1 Baseline CNN ---")
 
 log_path = joinpath(LOG_DIR, "baseline_training_log.csv")
 open(log_path, "w") do io
-    println(io, "epoch,train_loss,val_loss,r_mean,r_midt")
+    println(io, "epoch,train_rloss,val_mse,r_mean,r_midt")
 end
 
-train_losses  = Float64[]
+train_rlosses = Float64[]
 val_losses    = Float64[]
-best_val_loss = Inf
+best_r_mean   = -Inf
 r_midt        = NaN
 
 for epoch in 1:EPOCHS
     perm = randperm(length(train_ids))
-    epoch_loss = 0.0
-    n_batches  = 0
+    epoch_rloss = 0.0
+    n_batches   = 0
 
     for start in 1:BATCH_SIZE:length(train_ids)
         batch_ids    = train_ids[perm[start:min(start + BATCH_SIZE - 1, end)]]
@@ -269,52 +272,56 @@ for epoch in 1:EPOCHS
         corrs        = corrs  |> device
 
         loss_val, grads = Flux.withgradient(model) do m
-            mse_loss(m(feats), corrs)
+            r_loss(m(feats), corrs)
         end
 
         Flux.update!(opt_state, model, grads[1])
-        epoch_loss += Float64(loss_val)
-        n_batches  += 1
+        epoch_rloss += Float64(loss_val)
+        n_batches   += 1
     end
 
-    train_loss = epoch_loss / n_batches
+    train_rloss = epoch_rloss / n_batches
     val_loss, r_per_t, _, _ = evaluate(model, val_ids, val_cache)
     r_mean = mean(r_per_t)
     r_midt = mean(r_per_t[div(Lt, 4):3*div(Lt, 4)])
 
-    push!(train_losses, train_loss)
-    push!(val_losses,   val_loss)
+    push!(train_rlosses, train_rloss)
+    push!(val_losses,    val_loss)
 
-    improved = val_loss < best_val_loss
+    # Cosine annealing: LR decays from LR → 0 over EPOCHS
+    new_lr = LR * (1 + cos(π * epoch / EPOCHS)) / 2
+    Flux.Optimisers.adjust!(opt_state, new_lr)
+
+    improved = r_mean > best_r_mean
     if improved
-        best_val_loss = val_loss
+        best_r_mean = r_mean
         jldsave(CHECKPOINT_PATH; model=Flux.cpu(model), epoch=epoch,
                 val_loss=val_loss, r_midt=r_midt)
     end
 
-    @printf("Epoch %3d/%d  train=%.5f  val=%.5f  r̄=%.3f  r̄(mid-t)=%.3f%s\n",
-            epoch, EPOCHS, train_loss, val_loss, r_mean, r_midt,
+    @printf("Epoch %3d/%d  r_loss=%.4f  val_mse=%.4f  r̄=%.3f  r̄(mid-t)=%.3f%s\n",
+            epoch, EPOCHS, train_rloss, val_loss, r_mean, r_midt,
             improved ? "  ✓ saved" : "")
 
     open(log_path, "a") do io
         @printf(io, "%d,%.6f,%.6f,%.6f,%.6f\n",
-                epoch, train_loss, val_loss, r_mean, r_midt)
+                epoch, train_rloss, val_loss, r_mean, r_midt)
     end
 end
 
 # Save the final model regardless of whether it is the best.
 jldsave(FINAL_PATH; model=Flux.cpu(model), epoch=EPOCHS,
-        val_loss=val_losses[end], r_midt=r_midt)
+        val_mse=val_losses[end], r_midt=r_midt)
 
 # ---------------------------------------------------------------------------
 # Loss curve plot
 # ---------------------------------------------------------------------------
 
 fig, ax = subplots(figsize=(7, 4))
-ax.plot(1:EPOCHS, train_losses, label="train")
-ax.plot(1:EPOCHS, val_losses,   label="val")
+ax.plot(1:EPOCHS, train_rlosses, label="train r-loss (-mean r)")
+ax.plot(1:EPOCHS, val_losses,    label="val MSE", linestyle="--")
 ax.set_xlabel("Epoch")
-ax.set_ylabel("MSE loss (normalised)")
+ax.set_ylabel("Loss")
 ax.set_title("Baseline CNN — loss curve")
 ax.legend()
 fig.tight_layout()
